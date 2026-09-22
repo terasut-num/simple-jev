@@ -1,0 +1,13 @@
+# Runtime dependencies for the GGUF llama.cpp server.
+llama-cpp-python>=0.3.35
+pydantic>=2
+fastapi
+uvicorn
+numpy
+jinja2
+huggingface-hub
+
+# Test dependencies.
+pytest
+pytest-asyncio
+httpx
