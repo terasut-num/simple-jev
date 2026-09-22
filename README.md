@@ -123,33 +123,33 @@ JSON
 
 Question IDs become keys in `answers`.
 
-### CPU comparison with the original PyTorch server
+### CPU comparison with the original PyTorch server from [`Original repository`](https://github.com/featherless-ai/simple-jev)
 
 The following results use the same request. The original server ran the
-Hugging Face `Qwen/Qwen2.5-0.5B-Instruct` checkpoint with PyTorch:
+Hugging Face `Qwen/Qwen3.5-0.8B` checkpoint with PyTorch and A100 (80 GB):
 
 ```json
 {
-    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "model": "Qwen/Qwen3.5-0.8B",
     "answers": {
         "color": {
             "type": "choice",
-            "confidence": 0.877018392086029,
+            "confidence": 0.9999804496765137,
             "probabilities": {
-                "red": 0.877018392086029,
-                "blue": 0.12298166006803513
+                "red": 0.9999804496765137,
+                "blue": 1.9588253053370863e-05
             },
             "choice": "red"
         },
         "support": {
             "type": "score",
-            "confidence": 0.558726966381073,
+            "confidence": 0.5364056825637817,
             "probabilities": {
-                "0": 0.05434797331690788,
-                "1": 0.3869251012802124,
-                "2": 0.558726966381073
+                "0": 0.009136191569268703,
+                "1": 0.4544581472873688,
+                "2": 0.5364056825637817
             },
-            "score": 1.5043790340423584,
+            "score": 1.5272694826126099,
             "legend": {
                 "0": "Unsupported",
                 "1": "Partially supported",
@@ -158,41 +158,40 @@ Hugging Face `Qwen/Qwen2.5-0.5B-Instruct` checkpoint with PyTorch:
         },
         "dog": {
             "type": "noul",
-            "noul": 0.010005198717117306
+            "noul": 0.010081952810287469
         }
     },
     "usage": {
-        "input_tokens": 743,
+        "input_tokens": 796,
         "output_tokens": 0
     }
 }
 ```
 
-The llama.cpp server ran
-`qwen2.5-0.5b-instruct-fp16.gguf` on CPU with `--dtype float32`:
+The llama.cpp server ran `Qwen3.5-0.8B-BF16.gguf` on GPU (RTX 4060) with `--dtype float32`:
 
 ```json
 {
-  "model": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+  "model": "unsloth/Qwen3.5-0.8B-GGUF",
   "answers": {
     "color": {
       "type": "choice",
-      "confidence": 0.8988586068153381,
+      "confidence": 0.9999802112579346,
       "probabilities": {
-        "red": 0.8988586068153381,
-        "blue": 0.10114137083292007
+        "red": 0.9999802112579346,
+        "blue": 1.9806906493613496e-05
       },
       "choice": "red"
     },
     "support": {
       "type": "score",
-      "confidence": 0.6025716662406921,
+      "confidence": 0.5352787971496582,
       "probabilities": {
-        "0": 0.03482682630419731,
-        "1": 0.36260151863098145,
-        "2": 0.6025716662406921
+        "0": 0.009363764896988869,
+        "1": 0.45535746216773987,
+        "2": 0.5352787971496582
       },
-      "score": 1.5677448511123657,
+      "score": 1.5259150266647339,
       "legend": {
         "0": "Unsupported",
         "1": "Partially supported",
@@ -201,11 +200,11 @@ The llama.cpp server ran
     },
     "dog": {
       "type": "noul",
-      "noul": 0.010013843774795523
+      "noul": 0.010085486769676195
     }
   },
   "usage": {
-    "input_tokens": 743,
+    "input_tokens": 796,
     "output_tokens": 0
   }
 }
@@ -313,6 +312,8 @@ If all four suffixes fit in one batch, the shared execution takes one prefix dec
 
 `--max-batch-size` limits questions per suffix batch; `--max-batch-tokens` limits the number of packed suffix tokens in that batch. Neither limits total model/cache memory or chunks the shared prefix. The current server reuses the KV pool within a request and processes model requests serially. See the [GGUF execution guide](hf-server/README.md#shared-prefix-execution) for details.
 
+Sharing the prefix depends on the model being able to copy its cached state between sequences. `--prefix-sharing auto` (the default) does that for ordinary attention models, and falls back to prefilling each question's full prompt for recurrent or hybrid architectures, which carry rolling state instead of per-position cells. Those models used to be rejected at startup; `--prefix-sharing on` opts them back into sharing. See [Recurrent and hybrid architectures](hf-server/README.md#recurrent-and-hybrid-architectures).
+
 ## Shared prompt contract and project layout
 
 | Location | Purpose |
@@ -338,7 +339,7 @@ python -m pytest -c hf-server/pyproject.toml common/tests hf-server/tests -q
 
 The tests cover request validation, prompt construction, response scoring, tensor/token mapping, HTTP behavior, and shared-prefix-versus-full-prompt inference. The GGUF backend's orchestration tests run against a stubbed engine without any weights; its real-engine tests are opt-in via `SIMPLE_JEV_GGUF` pointing at a local GGUF file. They do not measure classification accuracy.
 
-Models need a GGUF file with a usable chat template, a non-recurrent architecture whose KV state can be shared across sequences, and answer labels that each extend the rendered prompt by exactly one distinct token. The server checks label tokenization; compatibility with every open model is not guaranteed.
+Models need a GGUF file with a usable chat template and answer labels that each extend the rendered prompt by exactly one distinct token. Architectures whose KV state cannot be shared across sequences — recurrent and hybrid stacks — are supported too, prefilling each question separately instead. The server checks label tokenization; compatibility with every open model is not guaranteed.
 
 ## One more thing: Really Fancy Decision Training (RFDT)
 

@@ -267,6 +267,8 @@ values), `probabilities` (nine values), `expected_score`, `variance`, and `entro
 | `metadata.gguf_path` | Resolved local GGUF file path. |
 | `metadata.n_gpu_layers` | Resolved layer offload count (`-1` = all layers). |
 | `metadata.kv_cache_dtype` | KV cache element type selected by `--dtype`. |
+| `metadata.stateful_architecture` | True when the model reports recurrent or hybrid state (`llama_model_is_recurrent` / `llama_model_is_hybrid`). Such models carry rolling state rather than per-position KV cells. |
+| `metadata.prefix_sharing` | True when branches share prefix KV cells, false when each branch prefills its own complete prompt. Resolved from `--prefix-sharing` and `metadata.stateful_architecture`. |
 | `metadata.rope_factor` | Startup `--rope-factor`. |
 | `metadata.template_version` | The resolved shared template version: `v1`. |
 | `metadata.calibration` | `not_calibrated` |
@@ -277,8 +279,8 @@ values), `probabilities` (nine values), `expected_score`, `variance`, and `entro
 | Field | Meaning |
 | --- | --- |
 | `backend` | `llama-cpp` |
-| `prefill_strategy` | `shared_prefix` |
-| `prefix_tokens` | Length of the shared prefix actually decoded once. At least one token is left for each suffix, even for identical prompts. |
+| `prefill_strategy` | `shared_prefix`, or `per_branch` when prefix sharing is disabled and every branch prefills its own complete prompt. |
+| `prefix_tokens` | Length of the shared prefix actually decoded once. At least one token is left for each suffix, even for identical prompts. `0` under `per_branch`. |
 | `suffix_batch_sizes` | Number of question/candidate branches in each packed suffix decode. |
 | `engine_forwards` | Prefix decode, if any, plus suffix decodes. These are engine calls, not HTTP calls. |
 | `branch_prompt_tokens` | Sum of all complete branch lengths, including repeated prefixes. |
@@ -315,6 +317,16 @@ cells, then packed into one `llama_decode` call without padding tokens.
 A single suffix larger than the token budget returns 422.
 The prefix decode itself is not chunked by this budget. There is no persistent
 cross-request prefix cache or continuous cross-request batching.
+
+When prefix sharing is disabled — `--prefix-sharing off`, or `auto` on a
+recurrent/hybrid architecture — there is no prefix decode and no `seq_cp` step.
+Each branch decodes its complete prompt on its own sequence id, still packed
+into one padding-free `llama_decode` per batch. Each row's length is then the
+whole prompt rather than a suffix, which changes two limits: `--max-batch-tokens`
+must be at least the longest compiled branch or the request returns 422, and
+rows per decode are bounded by `n_ctx // longest_branch`. Sizing
+`--max-model-len` and `--max-batch-tokens` equal to each other therefore scores
+one branch per decode.
 
 GPU backends (Vulkan) introduce kernel-level floating-point differences
 relative to CPU; see the precision notes in the README. Use `--device cpu
@@ -379,16 +391,18 @@ These are process settings, not HTTP request fields. Both `simple-jev` and
 | `--rope-factor` | `1` | Experimental linear RoPE interpolation factor applied to the context. |
 | `--max-model-len` | `16384` | Maximum token length of each compiled branch; also sizes the unified KV pool and is clamped to the model's trained context. |
 | `--max-batch-size` | `32` | Maximum suffix rows per decode; the context allows one prefix sequence plus this many row sequences. |
-| `--max-batch-tokens` | `32768` | Maximum packed suffix tokens per decode; must be positive. Does not chunk or limit the prefix decode. |
+| `--max-batch-tokens` | `32768` | Maximum packed suffix tokens per decode; must be positive. Does not chunk or limit the prefix decode. Bounds complete branch lengths, not suffixes, when prefix sharing is disabled. |
 | `--max-request-branches` | `100` | Positive branch cap per classifier request, subject to schema hard limits. |
+| `--prefix-sharing` | `auto` | `auto`, `on` or `off`. Whether branches share prefix KV cells via `llama_memory_seq_cp`. `auto` shares them for ordinary attention models and disables sharing for recurrent/hybrid architectures, which then prefill each branch separately. `on` forces sharing for every architecture; `off` forces per-branch prefill. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | HTTP port. |
 | `-h`, `--help` | — | Print argument help and exit. |
 
 No CLI flags are currently provided for authentication, quantization, model
 aliases, request queue size, request concurrency, or vision. The service
-requires GGUF models with a chat template, non-recurrent architectures that can
-share a prefix KV cache, and suitable single-token rating/choice labels;
+requires GGUF models with a chat template and suitable single-token
+rating/choice labels. Recurrent and hybrid architectures, whose state cannot be
+assumed sequence-copyable, are accepted and default to per-branch prefill;
 arbitrary GGUF files are not guaranteed to work.
 
 ## Source of truth

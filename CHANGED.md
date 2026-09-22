@@ -23,7 +23,7 @@ Reference upstream: <https://github.com/featherless-ai/simple-jev/tree/main>
 **Preserved without change** (core classification logic and API contracts):
 - `common/` request validation, v1 prompt building, label semantics, softmax/scoring math, response envelope
 - HTTP surface: `POST /v1/classifier`, alias `POST /v1/systemone`, `GET /health`, `/docs`; 422/429/499 error shapes and headers
-- Metrics key names (`prefix_tokens`, `suffix_batch_sizes`, `engine_forwards`, `branch_prompt_tokens`, `computed_prompt_tokens`, `logical_prefill_tokens`, `padded_suffix_tokens`, `branch_output_tokens=0`, `scored_positions`, `backend_seconds`, `queue_seconds`, `total_seconds`, `prefill_strategy="shared_prefix"`)
+- Metrics key names (`prefix_tokens`, `suffix_batch_sizes`, `engine_forwards`, `branch_prompt_tokens`, `computed_prompt_tokens`, `logical_prefill_tokens`, `padded_suffix_tokens`, `branch_output_tokens=0`, `scored_positions`, `backend_seconds`, `queue_seconds`, `total_seconds`, `prefill_strategy="shared_prefix"` — which later gained a second value, see §8)
 - Usage accounting: unique token-prefix union for `input_tokens`, `output_tokens` always 0
 - Advanced-metrics opt-in (`ENABLE_OPEN_JEV_ADVANCED_METRICS`, `raw_logits`)
 - Queue/concurrency model: concurrency 1, 16 queued slots, cooperative cancellation between batches under the model lock
@@ -42,6 +42,8 @@ The shared-prefix execution strategy was translated to llama.cpp's multi-sequenc
 4. All rows of the batch are packed into **one** `llama_decode` call: no padding tokens, explicit `pos` continuing after the prefix, `logits[i]` flagged only at each row's final suffix token.
 5. `llama_get_logits_ith` is read at each row's flagged batch position; only the permitted label token ids are converted to plain Python floats, keyed by the plan's exact output labels.
 6. `llama_memory_seq_rm(memory, row+1, 0, -1)` after each batch drops the rows' claims on shared cells and frees their suffix cells, making both cells and sequence ids reusable for the next batch.
+
+Steps 2 and 3 are skipped when prefix sharing is disabled (§8): the prefix is empty, each branch decodes its complete prompt on its own sequence id, and the rest of the loop is unchanged.
 
 Batching keeps the previous engine's shape: suffixes sorted longest-first, rows bounded by `--max-batch-size`, by `max_batch_tokens // width` (width of the longest suffix in the batch), and by the remaining KV cell budget `(n_ctx - prefix) // width`.
 
@@ -73,7 +75,7 @@ The engine swap was preceded by probe scripts against a real GGUF to pin down ll
 7. **`llama_batch` memory is recycled and uninitialized.** Every field of every used slot must be set; failures surface as misleading "invalid token[i] = <garbage>" messages. Batch arrays are filled through cached ctypes handles to avoid repeated pointer fetches.
 8. **`n_outputs_max_per_seq` defaults to 1** — one flagged output per sequence per decode is the safe contract for multi-row scoring batches.
 9. **ggml_type values**: F32=0, F16=1, BF16=30. The constants are not re-exported by `llama_cpp.py`, so `KV_CACHE_TYPES = {"float32": 0, "float16": 1, "bfloat16": 30}` maps `--dtype` to `type_k`/`type_v`.
-10. **Recurrent/hybrid architectures cannot share prefixes** (`llama_memory_seq_cp` cannot copy their state). The loader rejects them via `llama_model_is_recurrent` / `llama_model_is_hybrid`.
+10. **Recurrent/hybrid architectures were taken to be unable to share prefixes** — `llama_memory_seq_cp` was assumed unable to copy their rolling state — so the loader rejected them outright via `llama_model_is_recurrent` / `llama_model_is_hybrid`. This finding was re-measured against a real hybrid GGUF and did not hold; **superseded by §8**.
 11. **GGUF chat templates** live in `tokenizer.chat_template` metadata and render correctly with llama-cpp-python's `Jinja2ChatFormatter` (trim_blocks/lstrip_blocks and the `{% generation %}` pass-through match HF). The formatter bakes `add_generation_prompt` in at construction, so one cached formatter is built per flag value; `enable_thinking` and other HF-style kwargs are forwarded into the render, mirroring Transformers.
 12. **Tokenization parity**: `LlamaModel.tokenize(text_bytes, add_bos, special)` with `add_bos=False` mirrors HF `encode(add_special_tokens=False)` when the rendered template already carries its special tokens.
 
@@ -91,8 +93,8 @@ The engine swap was preceded by probe scripts against a real GGUF to pin down ll
   - `resolve_n_gpu_layers` — maps `--device` (`cpu` → 0 layers; `auto`/`gpu`/`vulkan`/… → all layers) with `--n-gpu-layers` overriding.
   - `KV_CACHE_TYPES` — dtype → ggml_type mapping for the KV cache.
   - `configure_rope` (rewritten) — llama.cpp linear rope scaling on the context params.
-- **`load_service`**: `backend` default is now `"llama-cpp"`; the GGUF branch loads model + context with the parameters from §2, rejects recurrent/hybrid models and unsupported dtypes/devices, and reports metadata: `backend`, `model_revision`, `gguf_path`, `n_gpu_layers`, `kv_cache_dtype`, `rope_factor`. The Laya branch is unchanged.
-- **`main()`**: `--backend` choices are `["llama-cpp", "laya"]`; new `--n-gpu-layers`; `--dtype` help documents its KV-cache meaning. `--device`/`--dtype`/`--max-batch-tokens` keep their names for command compatibility.
+- **`load_service`**: `backend` default is now `"llama-cpp"`; the GGUF branch loads model + context with the parameters from §2, rejects unsupported dtypes/devices, and reports metadata: `backend`, `model_revision`, `gguf_path`, `n_gpu_layers`, `kv_cache_dtype`, `rope_factor`. It originally also rejected recurrent/hybrid models; §8 replaced that with a prefill-strategy choice and added the `stateful_architecture` and `prefix_sharing` metadata fields. The Laya branch is unchanged.
+- **`main()`**: `--backend` choices are `["llama-cpp", "laya"]`; new `--n-gpu-layers`; `--dtype` help documents its KV-cache meaning. `--device`/`--dtype`/`--max-batch-tokens` keep their names for command compatibility. `--prefix-sharing` was added later by §8.
 - Metrics: `backend` is `"llama-cpp"`; because rows are packed without padding, `computed_prompt_tokens == logical_prefill_tokens` and `padded_suffix_tokens` equals the packed suffix total (key names retained for API stability, meanings documented).
 
 ### `hf-server/pyproject.toml`
@@ -126,6 +128,7 @@ The engine swap was preceded by probe scripts against a real GGUF to pin down ll
 | `--n-gpu-layers` | new; explicit llama.cpp offload count, overrides `--device` |
 | `--revision` | used for the HF GGUF download |
 | `--gguf-file` | new; selects one `.gguf` from a Hugging Face repository with multiple variants, downloading only that file |
+| `--prefix-sharing` | added by §8; `auto` (default) / `on` / `off` selects the prefill strategy, replacing the hard rejection of recurrent/hybrid architectures |
 | others (`--max-model-len`, `--max-batch-size`, `--max-batch-tokens`, `--max-request-branches`, `--rope-factor`, `--subfolder`, `--host`, `--port`) | names unchanged; `--max-model-len` additionally sizes the KV pool and is clamped to the trained context |
 
 ---
@@ -148,6 +151,109 @@ The engine swap was preceded by probe scripts against a real GGUF to pin down ll
 ## 7. Known caveats
 
 1. **GPU precision**: exact parity with CPU (and with the previous Transformers implementation) is not guaranteed on GPU backends; this build's Vulkan kernels showed up to ~0.1 per-logit deviation for chunked decodes even with an f32 KV cache. Use `--device cpu --dtype float32` when scoring must be numerically anchored. Answers agreed in all live validation runs.
-2. **Model requirements**: GGUF with `tokenizer.chat_template`, non-recurrent/non-hybrid architecture, and single-token-stable answer labels at the assistant boundary (checked per branch by `PromptCompiler` as before). GGUFs lacking a chat template are rejected at load.
+2. **Model requirements**: GGUF with `tokenizer.chat_template` and single-token-stable answer labels at the assistant boundary (checked per branch by `PromptCompiler` as before). GGUFs lacking a chat template are rejected at load. Recurrent/hybrid architectures are supported as of §8, with per-branch prefill by default.
 3. **Laya**: unchanged, still requires its optional SDK and (for the RoPE numerical test) torch; both install extras remain.
 4. **`--backend transformers` is gone**: scripts passing it will now get an `Unknown backend` error.
+
+---
+
+## 8. Follow-up: prefix sharing on recurrent/hybrid architectures
+
+Date: 2026-09-22
+Scope: `hf-server/hf_server.py`, `hf-server/README.md`, root `README.md`.
+
+### 8.1 Why
+
+Loading a hybrid GGUF (`unsloth/Qwen3.5-4B-GGUF`) failed at startup:
+
+```
+ValueError: This GGUF architecture has recurrent/hybrid state and cannot share
+a prefix KV cache
+```
+
+That guard implemented §3 finding 10. The GGUF metadata confirms the
+classification — `general.architecture = qwen35`, carrying `qwen35.ssm.*` keys
+and `qwen35.full_attention_interval = 4`, i.e. SSM layers interleaved with a
+full-attention layer every fourth block — so `llama_model_is_hybrid` is right
+about the model. The open question was whether the *conclusion* still held on
+the current engine.
+
+### 8.2 Measurement
+
+Probed with llama-cpp-python 0.3.35 (Vulkan-enabled wheel, `n_gpu_layers=0`),
+comparing each strategy's **full logit vector** against a single-sequence,
+full-prefill baseline. Repeating that baseline reproduces bit-for-bit
+(`max|Δlogit| = 0.0000`), so any deviation below is real rather than jitter.
+
+Four branches over a shared 158-token prefix, 18–22 token suffixes:
+
+| Strategy | Dense Qwen2.5-0.5B *(already supported)* | Hybrid Qwen3.5-4B |
+| --- | --- | --- |
+| One sequence per decode | 0.0000 | 0.0000 |
+| 4 sequences packed, **no sharing** | 0.2807 | 0.3589 *(1 of 4 argmax flipped)* |
+| 4 sequences packed, `seq_cp` **shared prefix** | 0.3042 | 0.4117 |
+
+The middle row is the decisive one: the strategy that shares nothing drifts just
+as far. The spread tracks **multi-sequence batch shape**, not prefix sharing,
+and is already present on a dense model this server ships. Sharing adds little
+on top. Two controls agreed: reversing branch order within the batch changed
+nothing material (0.4019), and reaching the same state via
+`llama_state_seq_get_data` / `set_data` instead of `seq_cp` landed in the same
+band (0.3774).
+
+A second probe replicated `LlamaCppBackend._score` exactly — prefill seq 0 once,
+then per batch `seq_cp` → decode → `seq_rm` — with 8 branches over a 261-token
+prefix and ~50-token suffixes, split into two batches of four. This is where
+aliased state would surface, since batch 2 re-copies from a seq 0 that batch 1
+may have consumed:
+
+```
+batch 1 worst |Δlogit| = 0.4466
+batch 2 worst |Δlogit| = 0.1927      argmax matched baseline on all 8 branches
+```
+
+Batch 2 is *better* than batch 1. The prefix state survives re-copying, so
+`llama_memory_hybrid::seq_cp` duplicates recurrent state rather than aliasing
+it, and §3 finding 10 no longer describes this engine.
+
+**Not measured**: a pure recurrent model (`llama_model_is_recurrent` true, e.g.
+Mamba or RWKV). Only the hybrid case was exercised, which is why the default
+stays conservative.
+
+### 8.3 What changed
+
+- `LlamaCppBackend.__init__` takes `share_prefix=True`. When false, `_score`
+  leaves the common prefix empty, skips the `seq_cp` loop, and lets every branch
+  prefill its complete prompt on its own sequence id. Rows are still packed into
+  one padding-free `llama_decode`, and cleanup is unchanged.
+- `prefill_strategy` in the metrics reports `per_branch` in that mode, alongside
+  the existing `shared_prefix`.
+- `load_service` no longer raises for recurrent/hybrid models. It computes
+  `stateful` from `llama_model_is_recurrent` / `llama_model_is_hybrid` and
+  resolves a new `prefix_sharing` argument: `auto` (default) disables sharing
+  for stateful architectures and keeps it everywhere else, `on` forces sharing,
+  `off` forces per-branch prefill. An unknown mode raises.
+- Loader metadata gains `stateful_architecture` and `prefix_sharing`.
+- `main()` exposes `--prefix-sharing {auto,on,off}`.
+
+Behaviour for ordinary attention models is unchanged: `auto` resolves to
+`share_prefix=True`, which is the original code path.
+
+### 8.4 Operational note
+
+With sharing off, each row's length is its whole prompt rather than its suffix,
+so two existing limits change meaning: `--max-batch-tokens` must be at least the
+longest compiled prompt (it is validated against row length), and rows per
+decode are bounded by `n_ctx // longest_prompt`. Running
+`--max-model-len 4096 --max-batch-tokens 4096` therefore scores one branch per
+decode. Raise `--max-model-len` above the real prompt length, or use
+`--prefix-sharing on`, to keep branches batched.
+
+### 8.5 Validation
+
+- `python -m pytest tests -q` from `hf-server/` → **36 passed, 11 skipped**,
+  identical to the pre-change result; no test covered the removed guard.
+- The hybrid GGUF loads successfully under all three modes, with metadata
+  reporting `stateful_architecture=True` and `prefix_sharing` following the
+  selected mode.
+- `--help` still loads no weights.

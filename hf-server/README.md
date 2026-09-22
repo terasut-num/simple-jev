@@ -46,6 +46,12 @@ wheel — Vulkan devices are used automatically when present, with CPU fallback.
 `--dtype` now selects the KV cache element type (`float16` default on GPUs,
 `float32` for exact CPU scoring); GGUF weights keep their own quantization.
 
+`--prefix-sharing` chooses how branches reuse the shared prompt. `auto` (the
+default) shares prefix KV cells for ordinary attention models and switches
+recurrent/hybrid architectures to per-branch prefill; `on` forces sharing for
+every architecture; `off` forces per-branch prefill. See
+[Recurrent and hybrid architectures](#recurrent-and-hybrid-architectures).
+
 ## API
 
 See the [complete HTTP API reference](API_REFERENCE.md) for all request fields,
@@ -109,6 +115,31 @@ against the context; parallelism is within each request. The pool is cleared
 per request, with no persistent cross-request cache. The prefix prefill is one
 decode and is not chunked by `--max-batch-tokens`.
 
+### Recurrent and hybrid architectures
+
+Architectures that carry rolling state — pure recurrent stacks such as Mamba or
+RWKV, and hybrid attention/SSM stacks such as `qwen35` — report true from
+`llama_model_is_recurrent` or `llama_model_is_hybrid`. They previously failed to
+load. They now load and, under `--prefix-sharing auto`, run with **per-branch
+prefill**: the common prefix is left empty, each branch decodes its own complete
+prompt on its own sequence id, and rows are still packed into one `llama_decode`
+with no padding. That strategy is valid for every architecture and costs only
+the prefill it stops sharing.
+
+Two limits change meaning when sharing is off, because each row's length becomes
+its whole prompt rather than its suffix: `--max-batch-tokens` must be at least
+the longest compiled prompt, and rows per decode are bounded by
+`n_ctx // longest_prompt`. Size `--max-model-len` and `--max-batch-tokens` with
+that in mind, or branches end up scored one per decode.
+
+`--prefix-sharing on` keeps `seq_cp` sharing for these models. On
+llama-cpp-python 0.3.35 with a hybrid `qwen35` GGUF, sharing agrees with
+per-branch prefill about as closely as sharing already agrees with it on a dense
+model, which indicates `llama_memory_hybrid::seq_cp` duplicates recurrent state
+rather than aliasing it; [CHANGED.md §8](../CHANGED.md) records the measurements.
+Pure recurrent architectures were not measured, so verify before relying on `on`
+for one.
+
 ## Precision notes
 
 The CPU backend is the numerical reference: on it, shared-prefix scores equal
@@ -126,10 +157,11 @@ approximately equal, not identical.
 This reference currently accepts **text only**, including text messages.
 Images, audio, video and tool calls are rejected. A multimodal GGUF does not
 imply multimodal input support. Models must be GGUF files with a
-`tokenizer.chat_template`, a non-recurrent/non-hybrid architecture (recurrent
-state cannot be sequence-copied for shared prefixes), and single-token
-rating/choice labels at the assistant boundary. Arbitrary model compatibility
-is not guaranteed.
+`tokenizer.chat_template` and single-token rating/choice labels at the assistant
+boundary. Recurrent and hybrid architectures are accepted and default to
+per-branch prefill, described in
+[Recurrent and hybrid architectures](#recurrent-and-hybrid-architectures).
+Arbitrary model compatibility is not guaranteed.
 
 The shared v1 prompt and scoring rules are the source of truth for this server.
 It does not claim exact numeric equivalence with another inference engine.
