@@ -71,12 +71,9 @@ must be numerically anchored.
 
 CPU execution verifies deterministic llama.cpp scoring, but does not guarantee
 bit-for-bit agreement with the original PyTorch server. `--dtype float32`
-selects the llama.cpp KV-cache precision only; it does not convert GGUF model
-weights. For example, `qwen2.5-0.5b-instruct-fp16.gguf` retains FP16 weights,
-while the original Hugging Face checkpoint may load with a different weight
-precision. Different kernels, weight formats, and accumulation behavior can
-therefore shift raw logits and their softmax probabilities slightly even when
-the prompt, token accounting, and selected answer are the same.
+selects the llama.cpp KV-cache precision only. Different kernels, weight formats, 
+and accumulation behavior can therefore shift raw logits and their softmax probabilities 
+slightly even when the prompt, token accounting, and selected answer are the same.
 
 The Laya example loads the specialized Typed Decisions checkpoint. Use `--device cuda` for an NVIDIA GPU, and send `"model": "convaiinnovations/laya"` in API requests. Its default native limit is 1,024 tokens per question. This example explicitly enables experimental 2× linear RoPE interpolation and a 2,048-token sequence budget, including instructions, options, and state. Both full and sliding attention rotary frequencies are halved; the local attention window is unchanged. This enables longer inputs but does not establish accuracy or calibration beyond the checkpoint's training length. Omit `--rope-factor 2` to retain the native behavior. See [Laya backend details](hf-server/README.md#laya-backend).
 
