@@ -1,5 +1,3 @@
-![Simple Jev Mascot and Logo](./imgs/Simple-Jev-Logo.png)
-
 # Simple Jev Project with llama.cpp and GGUF implementation
 
 Use compatible open models from huggingface, for structured classification and scoring, without training a separate classifier head.
