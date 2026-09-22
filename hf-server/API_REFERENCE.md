@@ -1,6 +1,6 @@
 # Simple-JEV HTTP API reference
 
-This reference describes the standalone Hugging Face implementation in
+This reference describes the standalone llama.cpp implementation in
 `hf_server.py`, version 0.1.0. It does not require vLLM. The API evaluates many
 questions against one context and returns JSON in one non-streaming response.
 It reads selected next-token logits; it does not generate prose answers.
@@ -26,11 +26,11 @@ error, ignored-field and runtime-limit details below are more complete.
 
 ## Quick start
 
-After installation, start the server with a model that supports the reference's
-cache and tokenizer requirements:
+After installation, start the server with a GGUF model that carries a chat
+template and single-token answer labels:
 
 ```bash
-simple-jev --model Qwen/Qwen3.5-2B --host 0.0.0.0 --port 8000
+simple-jev --model Qwen/Qwen2.5-0.5B-Instruct-GGUF --host 0.0.0.0 --port 8000
 ```
 
 Use that same model identifier in requests:
@@ -192,11 +192,13 @@ Every successful response contains:
 | `model` | Request model identifier. |
 | `answers` | Object keyed by the supplied question IDs. |
 | `usage.input_tokens` | Exact union of token prefixes across the compiled question branches. Shared prefixes count once. Includes classifier instructions, examples, template tokens and suffixes. |
-| `usage.output_tokens` | Always 0 for this HF backend: it scores logits without sampling output tokens. |
+| `usage.output_tokens` | Always 0 for this backend: it scores logits without sampling output tokens. |
 
 Usage excludes padding. It is logical unique-prefix accounting, not a measurement
 of all actual model work: suffix batches can recompute additional overlap beyond
 the common seed prefix. It is not persistent-cache billing across requests.
+GPU backends add kernel-level floating-point differences relative to CPU
+scoring; see the precision notes in the README.
 
 ### Choice
 
@@ -260,8 +262,12 @@ values), `probabilities` (nine values), `expected_score`, `variance`, and `entro
 
 | Field | Value/meaning |
 | --- | --- |
-| `metadata.backend` | `transformers` |
+| `metadata.backend` | `llama-cpp` |
 | `metadata.model_revision` | Startup `--revision`, or null. |
+| `metadata.gguf_path` | Resolved local GGUF file path. |
+| `metadata.n_gpu_layers` | Resolved layer offload count (`-1` = all layers). |
+| `metadata.kv_cache_dtype` | KV cache element type selected by `--dtype`. |
+| `metadata.rope_factor` | Startup `--rope-factor`. |
 | `metadata.template_version` | The resolved shared template version: `v1`. |
 | `metadata.calibration` | `not_calibrated` |
 | `metadata.usage_accounting` | `unique_token_prefixes_and_engine_leaf_outputs` (legacy identifier). |
@@ -270,15 +276,15 @@ values), `probabilities` (nine values), `expected_score`, `variance`, and `entro
 
 | Field | Meaning |
 | --- | --- |
-| `backend` | `transformers` |
+| `backend` | `llama-cpp` |
 | `prefill_strategy` | `shared_prefix` |
-| `prefix_tokens` | Length of the shared prefix actually evaluated once. At least one token is left for each suffix, even for identical prompts. |
-| `suffix_batch_sizes` | Number of question/candidate branches in each suffix forward. |
-| `engine_forwards` | Prefix forward, if any, plus suffix forwards. These are model calls, not HTTP calls. |
+| `prefix_tokens` | Length of the shared prefix actually decoded once. At least one token is left for each suffix, even for identical prompts. |
+| `suffix_batch_sizes` | Number of question/candidate branches in each packed suffix decode. |
+| `engine_forwards` | Prefix decode, if any, plus suffix decodes. These are engine calls, not HTTP calls. |
 | `branch_prompt_tokens` | Sum of all complete branch lengths, including repeated prefixes. |
-| `computed_prompt_tokens` | Shared prefix length plus padded suffix tokens. |
+| `computed_prompt_tokens` | Shared prefix length plus all packed suffix tokens decoded. |
 | `logical_prefill_tokens` | Shared prefix length plus unpadded suffix lengths. |
-| `padded_suffix_tokens` | Sum of batch size times maximum suffix length for each batch. |
+| `padded_suffix_tokens` | Equal to the packed suffix tokens: rows are packed without padding tokens in this engine. |
 | `branch_output_tokens` | 0 |
 | `scored_positions` | Number of scoring branches. |
 | `backend_seconds` | Backend elapsed time inside model lock. |
@@ -301,12 +307,18 @@ This CLI limit is not automatically clamped to the model's native context limit;
 configure it appropriately for the model. Setting it higher does not add model
 support for longer sequences.
 
-The backend evaluates the exact common prefix once and copies its Transformers
-cache for each suffix batch. Suffixes are sorted by length, batched under
-`--max-batch-size` and the padded `--max-batch-tokens` budget, and reordered for
-response assembly. A single suffix larger than the token budget returns 422.
-The prefix forward itself is not chunked by this budget. There is no persistent
+The backend decodes the exact common prefix once on sequence 0 of a unified
+KV pool, then copies the prefix cells into per-row sequences for each suffix
+batch with `llama_memory_seq_cp`. Suffixes are sorted by length, batched under
+`--max-batch-size`, the packed `--max-batch-tokens` budget, and the remaining KV
+cells, then packed into one `llama_decode` call without padding tokens.
+A single suffix larger than the token budget returns 422.
+The prefix decode itself is not chunked by this budget. There is no persistent
 cross-request prefix cache or continuous cross-request batching.
+
+GPU backends (Vulkan) introduce kernel-level floating-point differences
+relative to CPU; see the precision notes in the README. Use `--device cpu
+--dtype float32` when exact numerical anchoring matters.
 
 Client disconnects cancel the service task. An in-flight model forward cannot
 be immediately interrupted; the backend observes cancellation between forwards
@@ -356,27 +368,33 @@ These are process settings, not HTTP request fields. Both `simple-jev` and
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `--model` | Required | HF model ID or local pretrained model directory. Also the accepted request `model` string. |
-| `--revision` | Unset | HF revision passed to tokenizer, config and model loading. |
-| `--device` | `auto` | Passed as Transformers `device_map`; examples: `auto`, `cpu`, `cuda:0`. ROCm PyTorch also uses CUDA device naming. |
-| `--dtype` | `bfloat16` | One of `float32`, `float16`, `bfloat16`. |
-| `--max-model-len` | `16384` | Maximum token length of each compiled branch. |
-| `--max-batch-size` | `32` | Maximum suffix rows per model forward; must be positive. |
-| `--max-batch-tokens` | `32768` | Maximum padded suffix tokens per batch; must be positive. Does not chunk or limit the prefix forward. |
-| `--max-request-branches` | `100` | Positive expanded-branch cap per classifier request, subject to schema hard limits. |
+| `--model` | Required | GGUF file path, directory containing exactly one `.gguf`, or a Hugging Face GGUF repository id. Also the accepted request `model` string. |
+| `--revision` | Unset | Hugging Face revision used when downloading the GGUF. |
+| `--gguf-file` | Unset | One `.gguf` filename to download from a Hugging Face repository with multiple variants. |
+| `--backend` | `llama-cpp` | `llama-cpp` or `laya`. |
+| `--subfolder` | Unset | Laya checkpoint subfolder, e.g. `multilingual`. |
+| `--device` | `auto` | Weight placement: `cpu` keeps everything on the host; `auto`/`gpu`/`vulkan` offload all layers to any available llama.cpp backend with CPU fallback. |
+| `--n-gpu-layers` | Derived from `--device` | Explicit llama.cpp layer offload count; `-1` for all layers, overrides `--device`. |
+| `--dtype` | `bfloat16` | One of `float32`, `float16`, `bfloat16`: the KV cache element type. GGUF weights keep their own quantization. |
+| `--rope-factor` | `1` | Experimental linear RoPE interpolation factor applied to the context. |
+| `--max-model-len` | `16384` | Maximum token length of each compiled branch; also sizes the unified KV pool and is clamped to the model's trained context. |
+| `--max-batch-size` | `32` | Maximum suffix rows per decode; the context allows one prefix sequence plus this many row sequences. |
+| `--max-batch-tokens` | `32768` | Maximum packed suffix tokens per decode; must be positive. Does not chunk or limit the prefix decode. |
+| `--max-request-branches` | `100` | Positive branch cap per classifier request, subject to schema hard limits. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | HTTP port. |
 | `-h`, `--help` | — | Print argument help and exit. |
 
 No CLI flags are currently provided for authentication, quantization, model
-aliases, request queue size, request concurrency, or vision. The service requires
-compatible copyable/reorderable Transformers caches and suitable single-token
-rating/choice labels; arbitrary HF models are not guaranteed to work.
+aliases, request queue size, request concurrency, or vision. The service
+requires GGUF models with a chat template, non-recurrent architectures that can
+share a prefix KV cache, and suitable single-token rating/choice labels;
+arbitrary GGUF files are not guaranteed to work.
 
 ## Source of truth
 
 - [Shared prompt structure](../common/PROMPT_STRUCTURE_V1.md)
 - [Shared prompt builder](../common/prompt_builder.py)
 - [Request schema](../common/request_schema.py)
-- [HF server: chat rendering, inference, service, HTTP routes, and CLI](hf_server.py)
+- [GGUF server: chat rendering, inference, service, HTTP routes, and CLI](hf_server.py)
 - [Scoring formulas](../common/response_scoring.py)

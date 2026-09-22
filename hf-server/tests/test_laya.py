@@ -1,5 +1,6 @@
 """Adapter contract tests, with a tiny stand-in for the optional Laya runtime."""
 
+import importlib.util
 import sys
 import types
 import pytest
@@ -138,6 +139,11 @@ def test_explicit_loader_preserves_revision_and_subfolder(monkeypatch):
     assert result.metadata["backend"] == "laya"
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None
+    or importlib.util.find_spec("transformers") is None,
+    reason="Laya RoPE extension tests need the optional torch runtime",
+)
 @pytest.mark.parametrize("factor", [1.5, 2.0, 2.25])
 def test_rope_extension_matches_original_scaled_position(factor):
     import torch
@@ -194,31 +200,87 @@ def test_rope_extension_rejects_incompatible_backends():
         extend_laya_rope(agent, 2)
 
 
-@pytest.mark.parametrize("factor", [1.5, 2.0, 2.25])
-def test_transformers_rope_configuration_and_forward(factor):
-    import torch
-    from transformers import Qwen3Config, Qwen3ForCausalLM
+def test_llama_cpp_loader_rejects_bad_inputs():
+    """The GGUF backend validates devices, dtypes, and backend names."""
+    from hf_server import KV_CACHE_TYPES, load_service, resolve_n_gpu_layers
+
+    assert KV_CACHE_TYPES == {"float32": 0, "float16": 1, "bfloat16": 30}
+    assert resolve_n_gpu_layers("cpu", None) == 0
+    assert resolve_n_gpu_layers("auto", None) == -1
+    assert resolve_n_gpu_layers("vulkan", None) == -1
+    assert resolve_n_gpu_layers("anything", 3) == 3
+    with pytest.raises(ValueError, match="Unknown device"):
+        resolve_n_gpu_layers("tpu", None)
+    with pytest.raises(ValueError, match="Unknown backend"):
+        load_service("unused", backend="vllm")
+    with pytest.raises(ValueError, match="dtype"):
+        load_service("unused", dtype="int4")
+
+
+def test_llama_cpp_rope_configuration():
+    """--rope-factor maps to llama.cpp linear rope scaling on the context."""
+    import llama_cpp
+
     from hf_server import configure_rope
 
-    config = Qwen3Config(
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        vocab_size=100,
-        max_position_embeddings=32,
+    params = llama_cpp.llama_context_default_params()
+    configure_rope(params, 1)
+    assert params.rope_scaling_type == (
+        llama_cpp.llama_context_default_params().rope_scaling_type
     )
-    baseline = Qwen3ForCausalLM(config).model.rotary_emb.inv_freq.clone()
-    configure_rope(config, factor)
-    model = Qwen3ForCausalLM(config).eval()
-    torch.testing.assert_close(model.model.rotary_emb.inv_freq, baseline / factor)
-    assert config.max_position_embeddings == int(32 * factor)
-    with torch.no_grad():
-        assert model(torch.ones((1, 48), dtype=torch.long)).logits.shape == (1, 48, 100)
-    with pytest.raises(ValueError, match="unscaled"):
-        configure_rope(config, 2)
+    assert params.rope_freq_scale == 0.0
+    configure_rope(params, 2)
+    assert params.rope_scaling_type == 1  # LLAMA_ROPE_SCALING_TYPE_LINEAR
+    assert params.rope_freq_scale == 0.5
+    configure_rope(params, 1.5)
+    assert params.rope_freq_scale == pytest.approx(1 / 1.5)
+    with pytest.raises(ValueError, match="finite"):
+        configure_rope(params, float("nan"))
+
+
+def test_resolve_gguf_paths(tmp_path):
+    """GGUF resolution accepts one file, one-file directories, and rejects more."""
+    from hf_server import resolve_gguf_path
+
+    single = tmp_path / "model.gguf"
+    single.write_bytes(b"GGUF....")
+    assert resolve_gguf_path(str(single), None) == str(single)
+    folder = tmp_path / "dir"
+    folder.mkdir()
+    (folder / "only.gguf").write_bytes(b"GGUF....")
+    assert resolve_gguf_path(str(folder), None) == str(folder / "only.gguf")
+    (folder / "second.gguf").write_bytes(b"GGUF....")
+    with pytest.raises(ValueError, match="Multiple"):
+        resolve_gguf_path(str(folder), None)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="No .gguf"):
+        resolve_gguf_path(str(empty), None)
+
+
+def test_resolve_gguf_remote_filename(monkeypatch, tmp_path):
+    """A selected remote GGUF downloads only the requested quantization."""
+    from hf_server import resolve_gguf_path
+
+    expected = tmp_path / "qwen-q4.gguf"
+    calls = {}
+
+    def hf_hub_download(**kwargs):
+        calls.update(kwargs)
+        return str(expected)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.hf_hub_download = hf_hub_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    assert resolve_gguf_path(
+        "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "main", "qwen-q4.gguf"
+    ) == str(expected)
+    assert calls == {
+        "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "filename": "qwen-q4.gguf",
+        "revision": "main",
+    }
 
 
 @pytest.mark.parametrize(
@@ -229,13 +291,3 @@ def test_invalid_rope_multiplier(factor):
 
     with pytest.raises(ValueError, match="finite and at least 1"):
         validate_rope_factor(factor)
-
-
-def test_fractional_capacity_rounds_down():
-    from transformers import Qwen3Config
-    from hf_server import configure_rope
-
-    config = Qwen3Config(max_position_embeddings=33)
-    configure_rope(config, 1.5)
-    assert config.max_position_embeddings == 49
-    assert config.rope_parameters["factor"] == 1.5

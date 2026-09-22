@@ -1,8 +1,8 @@
-"""Single-file Hugging Face classifier server using the shared common modules.
+"""Single-file GGUF classifier server using llama.cpp (llama-cpp-python).
 
 Run directly from a checkout (the sibling common/ folder is required)::
 
-    python hf-server/hf_server.py --model /path/to/model --device cpu --dtype float32
+    python hf-server/hf_server.py --model /path/to/model.gguf --device cpu
 
 Or install with pip install -e './hf-server[test]' and run::
 
@@ -10,7 +10,7 @@ Or install with pip install -e './hf-server[test]' and run::
     python -m hf_server --model organization/model --device auto
 
 Request flow:
-    Transformers: ClassifierRequest -> PromptCompiler -> HFBackend -> common.build_response
+    llama.cpp: ClassifierRequest -> PromptCompiler -> LlamaCppBackend -> common.build_response
     Laya: ClassifierRequest -> LayaBackend -> native encoder scoring -> response
 
 common owns validation, versioned classifier wording, label semantics, and answer
@@ -18,15 +18,18 @@ math. This file owns text-only role assembly, native chat/tokenizer boundaries,
 shared-prefix inference, queue/cancellation controls, usage accounting, HTTP, and
 startup. Model weights load only when load_service/main is called.
 
+The inference engine is llama.cpp through llama-cpp-python. Models must be GGUF
+files (or Hugging Face repositories containing one); weights are offloaded to
+Vulkan-capable GPUs when --device auto requests it. The engine never samples
+tokens: it scores the next-token logits of each branch's answer boundary.
+
 The sections below follow the data flow and retain the implementation notes for
-cache ownership, per-row logit selection, and asynchronous cleanup. Tests live in
+KV ownership, per-row logit selection, and asynchronous cleanup. Tests live in
 tests/; no separate simple_jev package or duplicate classifier template is needed.
 """
 
 import argparse
 import asyncio
-import copy
-import inspect
 import math
 import os
 import sys
@@ -129,7 +132,7 @@ class PromptCompiler:
         request may be a ClassifierRequest or an input dictionary. render_only
         returns roles/content and the shared plan for diagnostics/tests; it skips
         chat-template tokenization, token limits, and output-boundary checks.
-        Such a result must not be sent to HFBackend.score.
+        Such a result must not be sent to LlamaCppBackend.score.
 
         Unsupported media/tools, malformed token boundaries, and overlong prompts
         raise ValueError. Caller data is preserved when merging system messages.
@@ -229,12 +232,13 @@ class PromptCompiler:
 class BackendResult:
     """Results keyed by plan-local branch ID, independent of batch execution order.
 
-    HF stores one 1-D CPU float32 tensor per branch, ordered exactly like the
-    corresponding shared question's output_labels. The broad Any annotation also
-    permits label/float maps from test backends, accepted by common's scorer.
+    This server stores one label-to-float mapping per branch, keyed by the
+    shared plan's exact output labels and ordered like the corresponding
+    question's output_labels. The broad Any annotation also permits the same
+    form from test backends, accepted by common's scorer.
 
     metrics contains internal timing/token/batch counters. branch_output_tokens
-    is zero for HF logits-only inference. It does not supply input usage; the
+    is zero for logits-only inference. It does not supply input usage; the
     service computes the unique token-prefix union from the compiled prompts.
     """
 
@@ -275,35 +279,39 @@ def unique_prompt_tokens(sequences):
 # Shared-prefix model execution
 
 
-class HFBackend:
-    """Own one inference model and serialize all forwards through a thread lock."""
+class LlamaCppBackend:
+    """Own one llama.cpp context and serialize all decodes through a thread lock.
 
-    def __init__(self, model, *, max_batch_size=32, max_batch_tokens=32768):
-        """Set evaluation mode and bounds on padded suffix batches.
+    The context is a unified KV pool of n_ctx cells shared by sequence ids:
+    sequence 0 holds the request's common prefix; each suffix-batch row runs on
+    its own sequence id 1..N after a llama_memory_seq_cp copies the prefix cells.
+    Rows are packed into one llama_decode call per batch (no padding tokens),
+    with logits requested only at each row's final suffix position.
+    """
 
-        max_batch_size caps rows; max_batch_tokens caps rows times suffix width.
-        Neither bounds the prefix prefill or cache memory. The tokenizer/compiler
+    def __init__(self, model, context, *, max_batch_size=32, max_batch_tokens=32768):
+        """Bind one loaded model/context and bounds on packed suffix batches.
+
+        max_batch_size caps rows per decode and sequence ids (1 + rows must fit
+        the context's n_seq_max). max_batch_tokens caps the packed suffix token
+        count per decode; it does not bound the prefix prefill. The compiler
         enforces the full model-context limit separately.
         """
         if max_batch_size < 1 or max_batch_tokens < 1:
             raise ValueError("Batch limits must be positive")
-        self.model = model.eval()
+        self.model = model
+        self.context = context
         self.max_batch_size = max_batch_size
         self.max_batch_tokens = max_batch_tokens
-        # Protect the model even if cancellation returns before its thread exits.
+        # Protect the context even if cancellation returns before its thread exits.
         self._lock = threading.Lock()
-        # Some model classes accept selected sequence positions to avoid
-        # materializing all sequence logits. Fall back to full logits otherwise.
-        self._last_logits = (
-            "logits_to_keep" in inspect.signature(model.forward).parameters
-        )
 
     async def score(self, compiled):
-        """Run blocking model work in a worker thread with cooperative cancellation.
+        """Run blocking engine work in a worker thread with cooperative cancellation.
 
-        Cancelling an asyncio task cannot interrupt an in-flight tensor kernel.
-        Set a stop flag for the worker to check before its next batch, then let
-        cancellation propagate. The model lock remains held until the worker exits.
+        Cancelling an asyncio task cannot interrupt an in-flight GPU kernel.
+        Set a stop flag for the worker to check before its next decode, then let
+        cancellation propagate. The context lock remains held until the worker exits.
         """
         stop = threading.Event()
         try:
@@ -312,134 +320,143 @@ class HFBackend:
             stop.set()
             raise
 
-    def _score(self, compiled, stop):
-        """Execute one request; all model/cache work stays under the same lock."""
-        import torch
+    def _decode_rows(self, llama_cpp, rows):
+        """Pack rows into one llama_batch and decode; return flagged positions.
 
-        with self._lock, torch.inference_mode():
+        rows are (seq_id, pos_start, token_ids, want_last_logits) tuples. Every
+        field of every used slot is explicitly initialized: llama_batch memory
+        is recycled by the allocator and may otherwise contain garbage. Batch
+        arrays are written through one cached handle each to avoid re-fetching
+        the ctypes pointers for every element.
+        """
+        n_tokens = sum(len(tokens) for _, _, tokens, _ in rows)
+        batch = llama_cpp.llama_batch_init(n_tokens, 0, 1)
+        try:
+            batch.n_tokens = n_tokens
+            token, pos = batch.token, batch.pos
+            seq_id, n_seq_id, logits = batch.seq_id, batch.n_seq_id, batch.logits
+            index = 0
+            flagged = []
+            for seq, start, tokens, want in rows:
+                last = len(tokens) - 1
+                for offset, token_id in enumerate(tokens):
+                    token[index] = int(token_id)
+                    pos[index] = start + offset
+                    seq_id[index][0] = int(seq)
+                    n_seq_id[index] = 1
+                    logits[index] = bool(want and offset == last)
+                    index += 1
+                if want:
+                    flagged.append(index - 1)
+            if llama_cpp.llama_decode(self.context.ctx, batch) != 0:
+                raise RuntimeError("llama_decode failed for the scoring batch")
+            return flagged
+        finally:
+            llama_cpp.llama_batch_free(batch)
+
+    def _score(self, compiled, stop):
+        """Execute one request; all model/KV work stays under the same lock."""
+        import llama_cpp
+
+        with self._lock:
             if stop.is_set():
                 raise asyncio.CancelledError()
             start = time.perf_counter()
             sequences = [b.token_ids for b in compiled.branches]
             if not sequences or any(not ids for ids in sequences):
                 raise ValueError("Expected nonempty scoring prompts")
+            if compiled.plan is None:
+                raise ValueError("Backend scoring requires the compiled plan")
+            labels = {
+                question.branch_id: question.output_labels
+                for question in compiled.plan.questions
+            }
             # Leave at least one suffix token, including for identical prompts.
             prefix = common_prefix(sequences)[: min(map(len, sequences)) - 1]
-            # Inputs start on the embedding device; a dispatched/sharded model
-            # may move later activations using its own Transformers hooks.
-            device = self.model.get_input_embeddings().weight.device
-            extra = {"logits_to_keep": 1} if self._last_logits else {}
-            cache = None
-            forwards = 0
+            memory = self.context.memory
+            # Start every request from an empty KV pool: prefix work never
+            # persists across requests, so results cannot leak between callers.
+            llama_cpp.llama_memory_clear(memory, True)
+            decodes = 0
             if prefix:
-                # This is one unchunked forward. The returned cache is the seed;
-                # no suffix batch may mutate it or reuse another batch's cache.
-                ids = torch.tensor([prefix], device=device)
-                out = self.model(
-                    input_ids=ids,
-                    attention_mask=torch.ones_like(ids),
-                    use_cache=True,
-                    **extra,
-                )
-                cache = out.past_key_values
-                if cache is None or not hasattr(cache, "reorder_cache"):
-                    raise ValueError(
-                        "Model must expose a reorderable Transformers cache"
-                    )
-                del out
-                forwards += 1
+                # One unchunked prefill decode on sequence 0. No logits are
+                # needed here; every scoring position lives in the suffixes.
+                self._decode_rows(llama_cpp, [(0, 0, prefix, False)])
+                decodes += 1
             lengths = [len(ids) - len(prefix) for ids in sequences]
             if max(lengths) > self.max_batch_tokens:
                 raise ValueError("A question suffix exceeds max_batch_tokens")
-            # Longest first reduces padding. Results carry branch IDs, so map
-            # insertion/execution order need not equal the original question order.
+            # Longest first groups equal lengths together. Results carry branch
+            # IDs, so execution order need not equal the original question order.
             pending = sorted(
                 range(len(sequences)), key=lambda i: lengths[i], reverse=True
             )
             results = {}
             sizes = []
-            padded_tokens = 0
+            packed_tokens = 0
+            n_ctx = self.context.n_ctx()
             while pending:
                 if stop.is_set():
                     raise asyncio.CancelledError()
-                # Every row uses width slots, including right padding. Account
-                # for padded work, not just the sum of unpadded suffix lengths.
+                # Width-based limits mirror the previous engine's padded-batch
+                # accounting: rows times width bounded by max_batch_tokens, and
+                # every live KV cell (prefix plus suffixes) bounded by n_ctx.
                 width = lengths[pending[0]]
-                limit = min(self.max_batch_size, self.max_batch_tokens // width)
+                limit = min(
+                    self.max_batch_size,
+                    self.max_batch_tokens // width if width else 1,
+                    max(1, (n_ctx - len(prefix)) // width) if width else 1,
+                )
                 batch, pending = pending[:limit], pending[limit:]
-                # Forward mutates its cache. Never let a branch mutate the seed.
-                branch_cache = copy.deepcopy(cache)
-                if branch_cache is not None:
-                    # The seed has one row. Repeated index zero broadcasts that
-                    # row to the batch via the cache's supported reorder API.
-                    branch_cache.reorder_cache(
-                        torch.zeros(len(batch), dtype=torch.long, device=device)
-                    )
-                # Padding follows the scored position, never enters a real token's
-                # causal context, and is excluded from attention. Discard this cache.
-                ids = torch.zeros((len(batch), width), dtype=torch.long, device=device)
-                mask = torch.zeros(
-                    (len(batch), len(prefix) + width), dtype=torch.long, device=device
-                )
-                for row, i in enumerate(batch):
-                    ids[row, : lengths[i]] = torch.tensor(
-                        sequences[i][len(prefix) :], device=device
-                    )
-                    mask[row, : len(prefix) + lengths[i]] = 1
-                # Position IDs continue after the shared prefix. Attention masks
-                # include both prefix and suffix; real tokens cannot attend to
-                # right padding. Padded token ID zero is just unused storage.
-                positions = (
-                    torch.arange(len(prefix), len(prefix) + width, device=device)
-                    .unsqueeze(0)
-                    .expand(len(batch), -1)
-                )
-                last = torch.tensor([lengths[i] - 1 for i in batch], device=device)
-                # Unequal lengths mean different final positions per row.
-                # logits_to_keep accepts one position set shared across rows;
-                # inverse maps each row's last position into that returned set.
-                keep, inverse = torch.unique(last, sorted=True, return_inverse=True)
-                branch_extra = {"logits_to_keep": keep} if self._last_logits else {}
-                out = self.model(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    position_ids=positions,
-                    past_key_values=branch_cache,
-                    use_cache=True,
-                    **branch_extra,
-                )
-                selected = out.logits[
-                    torch.arange(len(batch), device=device),
-                    inverse if self._last_logits else last,
+                # Each row runs on its own sequence id sharing the prefix cells:
+                # the unified cache marks copied cells for both sequences, so
+                # attention sees prefix+suffix without recomputing the prefill.
+                for row in range(len(batch)):
+                    llama_cpp.llama_memory_seq_cp(memory, 0, row + 1, 0, len(prefix))
+                rows = [
+                    (row + 1, len(prefix), sequences[i][len(prefix):], True)
+                    for row, i in enumerate(batch)
                 ]
-                # Gather each branch's permitted tokens before leaving the batch.
-                # Compact CPU tensors avoid retaining full vocabulary/GPU buffers.
+                flagged = self._decode_rows(llama_cpp, rows)
+                # One flagged output per row, in batch order: read exactly the
+                # permitted label logits and copy them to plain Python floats.
                 for row, i in enumerate(batch):
                     branch = compiled.branches[i]
-                    results[branch.branch_id] = (
-                        selected[row, branch.output_ids].float().cpu()
+                    logits = llama_cpp.llama_get_logits_ith(
+                        self.context.ctx, flagged[row]
                     )
-                del out, branch_cache, selected
-                forwards += 1
+                    results[branch.branch_id] = {
+                        label: float(logits[token_id])
+                        for label, token_id in zip(
+                            labels[branch.branch_id], branch.output_ids
+                        )
+                    }
+                # Row sequences are discarded after each batch: seq_rm drops
+                # their claim on the shared prefix cells and frees their suffix
+                # cells, making both the cells and the sequence ids reusable.
+                for row in range(len(batch)):
+                    llama_cpp.llama_memory_seq_rm(memory, row + 1, 0, -1)
+                decodes += 1
                 sizes.append(len(batch))
-                padded_tokens += len(batch) * width
+                packed_tokens += sum(lengths[i] for i in batch)
             return BackendResult(
                 results,
                 {
-                    "backend": "transformers",
+                    "backend": "llama-cpp",
                     "prefill_strategy": "shared_prefix",
                     "prefix_tokens": len(prefix),
                     "suffix_batch_sizes": sizes,
-                    "engine_forwards": forwards,
+                    "engine_forwards": decodes,
                     # These are distinct accounting views, not interchangeable:
                     # branch_prompt_tokens repeats shared context per branch;
-                    # computed_prompt_tokens includes padding but prefixes once;
-                    # logical_prefill_tokens omits padding, still counting overlap
-                    # beyond the one shared prefix separately per branch.
+                    # computed_prompt_tokens counts cells the engine filled;
+                    # logical_prefill_tokens counts each branch's suffix once
+                    # beyond the single shared prefix. Rows are packed without
+                    # padding tokens, so the latter two views agree here.
                     "branch_prompt_tokens": sum(map(len, sequences)),
-                    "computed_prompt_tokens": len(prefix) + padded_tokens,
+                    "computed_prompt_tokens": len(prefix) + packed_tokens,
                     "logical_prefill_tokens": len(prefix) + sum(lengths),
-                    "padded_suffix_tokens": padded_tokens,
+                    "padded_suffix_tokens": packed_tokens,
                     "branch_output_tokens": 0,
                     "scored_positions": len(sequences),
                     "backend_seconds": time.perf_counter() - start,
@@ -455,31 +472,20 @@ def validate_rope_factor(factor):
         raise ValueError("RoPE factor must be finite and at least 1")
 
 
-def configure_rope(config, factor):
-    """Configure native Transformers linear interpolation on text RoPE only.
+def configure_rope(context_params, factor):
+    """Configure llama.cpp linear position interpolation on the context.
 
-    Preserve theta, partial rotary dimensions, and multimodal text-axis settings.
-    Refuse to replace existing scaling schemes. Admission remains controlled by
-    --max-model-len; extending positional capacity does not establish accuracy.
+    llama.cpp applies rope_freq_scale = 1/factor as its linear rope scaling:
+    position p then uses the original rotary angle at p/factor, matching the
+    engine's --rope-scale behavior. The admission limit stays governed by
+    --max-model-len; extending positional capacity does not establish accuracy,
+    and interpolation also changes short-input behavior.
     """
     validate_rope_factor(factor)
     if factor == 1:
         return
-    text = config.get_text_config()
-    params = copy.deepcopy(getattr(text, "rope_parameters", None))
-    if not isinstance(params, dict) or not params:
-        raise ValueError("Model does not expose supported RoPE parameters")
-    groups = [params] if "rope_type" in params else list(params.values())
-    active = [group for group in groups if group is not None]
-    if not active or any(
-        not isinstance(group, dict) or group.get("rope_type") != "default"
-        for group in active
-    ):
-        raise ValueError("RoPE extension requires unscaled default RoPE")
-    for group in active:
-        group.update(rope_type="linear", factor=float(factor))
-    text.rope_parameters = params
-    text.max_position_embeddings = int(text.max_position_embeddings * factor)
+    context_params.rope_scaling_type = 1  # LLAMA_ROPE_SCALING_TYPE_LINEAR
+    context_params.rope_freq_scale = 1.0 / float(factor)
 
 
 def extend_laya_rope(agent, factor):
@@ -762,7 +768,7 @@ class DecisionService:
                     advanced=self.advanced_metrics,
                 )
                 # Common handles answer filtering and authoritative version data;
-                # HF only adds backend-specific metadata and execution timings.
+                # the server only adds backend-specific metadata and timings.
                 if self.advanced_metrics:
                     response["metadata"] = {
                         **self.metadata,
@@ -777,7 +783,7 @@ class DecisionService:
                 return response
         finally:
             # Release service admission even if a cancelled worker is finishing.
-            # HFBackend's lock still prevents overlapping access to the model.
+            # The backend's lock still prevents overlapping access to the model.
             self._inflight -= 1
 
 
@@ -903,7 +909,7 @@ def attach_routes(app, get_service):
         finally:
             # Always observe the child task's completion/exception. Cancelling
             # its coroutine does not forcibly stop an active model worker thread;
-            # HFBackend implements cooperative stopping and a model lock.
+            # the backend implements cooperative stopping and a model lock.
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -914,15 +920,181 @@ def attach_routes(app, get_service):
 # Model loading and command-line entry point
 
 
+def resolve_gguf_path(model_name, revision, gguf_file=None):
+    """Return one local GGUF file path for a path, directory, or HF repository.
+
+    A directory must contain exactly one .gguf file (sharded files following
+    llama.cpp's <name>-00001-of-000NN.gguf scheme load together and count as
+    one). gguf_file selects one file from a directory or Hugging Face repository.
+    A Hugging Face repository is downloaded with huggingface_hub, keeping the
+    repository identifier as the request-visible model name.
+    """
+    path = Path(model_name)
+    if path.is_file():
+        if gguf_file:
+            raise ValueError("--gguf-file cannot be used with a GGUF file path")
+        return str(path)
+    if path.is_dir():
+        matches = sorted(path.glob(gguf_file or "*.gguf"))
+    else:
+        if gguf_file:
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError as exc:
+                raise ImportError(
+                    "Downloading GGUF weights requires huggingface-hub; install it "
+                    "or point --model at a local .gguf file"
+                ) from exc
+            if Path(gguf_file).name != gguf_file or not gguf_file.endswith(".gguf"):
+                raise ValueError("--gguf-file must name one .gguf file")
+            return hf_hub_download(
+                repo_id=model_name, filename=gguf_file, revision=revision
+            )
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise ImportError(
+                "Downloading GGUF weights requires huggingface-hub; install it "
+                "or point --model at a local .gguf file"
+            ) from exc
+        root = Path(snapshot_download(model_name, revision=revision, allow_patterns=["*.gguf"]))
+        matches = sorted(root.glob("*.gguf"))
+        # Shards named <name>-00001-of-000NN.gguf are loaded as one model from
+        # their first file; report the shard set, not each file, as the choice.
+        shards = [m for m in matches if "-of-" in m.name]
+        if shards:
+            first = shards[0]
+            matches = [first]
+    if not matches:
+        raise ValueError(f"No .gguf file found for model {model_name!r}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Multiple .gguf files found for {model_name!r}; pass one file path"
+        )
+    return str(matches[0])
+
+
+def resolve_n_gpu_layers(device, n_gpu_layers):
+    """Map the CLI device selection to llama.cpp layer offloading.
+
+    None means "derive from device": cpu disables offload entirely, while the
+    accelerator spellings (auto/gpu/vulkan/cuda/rocm/metal) offload every layer
+    so llama.cpp routes through any compiled backend, including Vulkan. An
+    explicit n_gpu_layers value always wins over --device.
+    """
+    if n_gpu_layers is not None:
+        if n_gpu_layers < -1:
+            raise ValueError("n_gpu_layers must be -1 or nonnegative")
+        return n_gpu_layers
+    normalized = device.strip().lower()
+    if normalized == "cpu":
+        return 0
+    if normalized in {"auto", "gpu", "vulkan", "cuda", "rocm", "metal"}:
+        return -1
+    raise ValueError(
+        f"Unknown device {device!r}; use cpu, auto, gpu, or an explicit --n-gpu-layers"
+    )
+
+
+KV_CACHE_TYPES = {"float32": 0, "float16": 1, "bfloat16": 30}
+# ggml_type enum: F32=0, F16=1, BF16=30 in this llama.cpp release. GGUF weights
+# keep their own quantization; --dtype selects only the KV cache precision.
+
+
+class LlamaCppTokenizer:
+    """Adapter from the HF-style tokenizer surface to one llama.cpp GGUF vocab.
+
+    PromptCompiler needs exactly two calls: apply_chat_template(tokenize=False)
+    and encode(text, add_special_tokens=False). Both are served natively by
+    llama.cpp — its tokenizer reads the GGUF's embedded vocabulary, and the
+    chat template is rendered from the GGUF's tokenizer.chat_template metadata
+    with the same Jinja environment settings llama-cpp-python uses (matching
+    Transformers' trim_blocks/lstrip_blocks conventions).
+    """
+
+    def __init__(self, model, metadata=None):
+        from llama_cpp.llama_chat_format import Jinja2ChatFormatter
+
+        self._model = model
+        metadata = metadata if metadata is not None else model.metadata()
+        template = metadata.get("tokenizer.chat_template")
+        if not template:
+            raise ValueError(
+                "GGUF file has no tokenizer.chat_template metadata; the shared "
+                "v1 template requires a chat-formatted model"
+            )
+        bos_text, eos_text = "", ""
+        try:
+            bos_id = int(metadata.get("tokenizer.ggml.bos_token_id", ""))
+            eos_id = int(metadata.get("tokenizer.ggml.eos_token_id", ""))
+            bos_text = model.token_get_text(bos_id) if 0 <= bos_id else ""
+            eos_text = model.token_get_text(eos_id) if 0 <= eos_id else ""
+        except ValueError:
+            pass
+        self._template = template
+        self._bos_text = bos_text
+        self._eos_text = eos_text
+        self._formatters = {}
+
+    def _formatter(self, add_generation_prompt):
+        """Build (and cache) a Jinja formatter per generation-prompt setting.
+
+        The formatter renders with its own constructor flag, so one cached
+        instance exists for each add_generation_prompt value the compiler uses.
+        """
+        if add_generation_prompt not in self._formatters:
+            from llama_cpp.llama_chat_format import Jinja2ChatFormatter
+
+            self._formatters[add_generation_prompt] = Jinja2ChatFormatter(
+                template=self._template,
+                eos_token=self._eos_text,
+                bos_token=self._bos_text,
+                add_generation_prompt=add_generation_prompt,
+            )
+        return self._formatters[add_generation_prompt]
+
+    def encode(self, text, add_special_tokens=False):
+        """Tokenize text with llama.cpp's native GGUF tokenizer.
+
+        add_special_tokens=False keeps the template responsible for BOS/EOS:
+        the rendered chat text already carries its special tokens, and adding
+        another BOS would alter the intended model input.
+        """
+        return self._model.tokenize(
+            text.encode("utf-8"), add_bos=bool(add_special_tokens), special=True
+        )
+
+    def apply_chat_template(self, messages, **kwargs):
+        """Render the GGUF chat template exactly as the compiler requests it.
+
+        tokenize must stay False: the compiler tokenizes the rendered text.
+        add_generation_prompt opens the assistant turn; enable_thinking and
+        any other Transformers-style flags are forwarded into the Jinja render,
+        the same forwarding Transformers performs for its thinking-capable
+        models.
+        """
+        if kwargs.get("tokenize"):
+            raise ValueError("This adapter renders chat templates as text only")
+        forward = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"tokenize", "add_generation_prompt"}
+        }
+        formatter = self._formatter(bool(kwargs.get("add_generation_prompt")))
+        return formatter(messages=messages, **forward).prompt
+
+
 def load_service(
     model_name,
     *,
     revision=None,
-    backend="transformers",
+    gguf_file=None,
+    backend="llama-cpp",
     subfolder=None,
     rope_factor=1,
     device="auto",
     dtype="bfloat16",
+    n_gpu_layers=None,
     max_model_len=16384,
     max_batch_size=32,
     max_batch_tokens=32768,
@@ -930,19 +1102,23 @@ def load_service(
 ):
     """Load a model and return a ready-to-use service, without starting HTTP.
 
-    device is passed to Transformers as device_map; dtype selects a torch dtype.
-    max_model_len limits each complete compiled prompt. max_batch_tokens limits
-    padded suffix tokens per batch, not shared-prefix prefill or total KV memory.
+    device selects weight placement: cpu keeps everything on the host, auto
+    offloads every layer to any available llama.cpp backend (Vulkan included)
+    and falls back to CPU where no device exists. dtype selects the KV cache
+    element type. max_model_len limits each complete compiled prompt and sizes
+    the unified KV pool. max_batch_tokens limits packed suffix tokens per
+    decode, not the shared-prefix prefill or total KV memory.
     max_request_branches caps questions admitted in a single request.
 
-    The loader sets service concurrency to one: separate requests are serialized,
-    while branches within a request are batched. The backend's thread lock also
-    prevents overlap if cancellation releases admission before a forward ends.
+    The loader sets service concurrency to one: separate requests are
+    serialized, while branches within a request are batched. The backend's
+    thread lock also prevents overlap if cancellation releases admission
+    before a decode ends.
     """
     validate_rope_factor(rope_factor)
     if backend == "laya":
         # Resolve the revision ourselves because the SDK does not expose it.
-        # Import only when selected; the existing HF installation stays usable.
+        # Import only when selected; a llama.cpp installation stays usable.
         try:
             import laya
         except ImportError as exc:
@@ -983,43 +1159,67 @@ def load_service(
                 "native_sequence_limit": agent.cfg["max_len"],
             },
         )
-    if backend != "transformers":
+    if backend != "llama-cpp":
         raise ValueError(f"Unknown backend: {backend}")
     if subfolder:
         raise ValueError("--subfolder is currently supported only with --backend laya")
+    if dtype not in KV_CACHE_TYPES:
+        raise ValueError(f"Unsupported dtype: {dtype}")
     # Heavy dependencies are local to loading, so CLI help and source inspection
-    # do not initialize a model or import the Transformers model classes.
-    import torch
-    from transformers import (
-        AutoConfig,
-        AutoModelForCausalLM,
-        AutoModelForImageTextToText,
-        AutoTokenizer,
-    )
+    # do not initialize a backend or import the model classes.
+    import llama_cpp
+    from llama_cpp import _internals
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
-    config = AutoConfig.from_pretrained(model_name, revision=revision)
-    configure_rope(config, rope_factor)
-    # These checkpoint families use the image/text auto-loader even for text
-    # scoring. This selection does not enable image input: the compiler remains
-    # text-only and rejects unsupported media/tool requests.
-    loader = (
-        AutoModelForImageTextToText
-        if config.model_type in {"gemma4", "qwen3_5", "qwen3_5_moe"}
-        else AutoModelForCausalLM
+    gguf_path = resolve_gguf_path(model_name, revision, gguf_file)
+    model_params = llama_cpp.llama_model_default_params()
+    resolved_layers = resolve_n_gpu_layers(device, n_gpu_layers)
+    # llama.cpp encodes "all layers" as INT32 max; -1 is this API's spelling.
+    model_params.n_gpu_layers = (
+        0x7FFFFFFF if resolved_layers == -1 else resolved_layers
     )
-    model = loader.from_pretrained(
-        model_name,
-        revision=revision,
-        config=config,
-        dtype=getattr(torch, dtype),
-        device_map=device,
+    model = _internals.LlamaModel(
+        path_model=gguf_path, params=model_params, verbose=False
+    )
+    # Recurrent and hybrid architectures carry state that cannot be copied by
+    # llama_memory_seq_cp, so the shared-prefix strategy is impossible for them.
+    if (
+        llama_cpp.llama_model_is_recurrent(model.model)
+        or llama_cpp.llama_model_is_hybrid(model.model)
+    ):
+        model.close()
+        raise ValueError(
+            "This GGUF architecture has recurrent/hybrid state and cannot share "
+            "a prefix KV cache"
+        )
+    n_ctx_train = model.n_ctx_train()
+    if max_model_len > n_ctx_train:
+        # The engine clamps its own n_ctx to the trained context; admission and
+        # the compiler limit must agree with it or requests would be rejected
+        # far from their validation point.
+        max_model_len = n_ctx_train
+    context_params = llama_cpp.llama_context_default_params()
+    context_params.n_ctx = max_model_len
+    # One decode must be able to hold the shared prefix and a full token budget.
+    # llama.cpp additionally clamps n_batch to n_ctx on its own.
+    context_params.n_batch = max(max_batch_tokens, max_model_len)
+    context_params.n_seq_max = max_batch_size + 1
+    # The unified KV pool is one shared array of n_ctx cells; sequence copies
+    # with a partial position range require it (the split cache asserts).
+    context_params.kv_unified = True
+    context_params.type_k = KV_CACHE_TYPES[dtype]
+    context_params.type_v = KV_CACHE_TYPES[dtype]
+    configure_rope(context_params, rope_factor)
+    context = _internals.LlamaContext(
+        model=model, params=context_params, verbose=False
     )
     # PromptCompiler's default comes from common.DEFAULT_TEMPLATE_VERSION.
-    # Keep one compiler/backend pair for the service's loaded model/tokenizer.
-    compiler = PromptCompiler(tokenizer, max_tokens=max_model_len)
-    backend = HFBackend(
+    # Keep one compiler/backend pair for the service's loaded model/context.
+    compiler = PromptCompiler(
+        LlamaCppTokenizer(model), max_tokens=max_model_len
+    )
+    backend = LlamaCppBackend(
         model,
+        context,
         max_batch_size=max_batch_size,
         max_batch_tokens=max_batch_tokens,
     )
@@ -1030,8 +1230,11 @@ def load_service(
         concurrency=1,
         max_request_branches=max_request_branches,
         metadata={
-            "backend": "transformers",
+            "backend": "llama-cpp",
             "model_revision": revision,
+            "gguf_path": gguf_path,
+            "n_gpu_layers": resolved_layers,
+            "kv_cache_dtype": dtype,
             "rope_factor": rope_factor,
         },
     )
@@ -1050,7 +1253,11 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--revision")
     parser.add_argument(
-        "--backend", choices=["transformers", "laya"], default="transformers"
+        "--gguf-file",
+        help="GGUF filename to download from a Hugging Face repository",
+    )
+    parser.add_argument(
+        "--backend", choices=["llama-cpp", "laya"], default="llama-cpp"
     )
     parser.add_argument(
         "--subfolder", help="Laya checkpoint subfolder, e.g. multilingual"
@@ -1065,7 +1272,14 @@ def main():
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
-        "--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16"
+        "--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16",
+        help="KV cache element type; GGUF weights keep their own quantization",
+    )
+    parser.add_argument(
+        "--n-gpu-layers",
+        type=int,
+        default=None,
+        help="llama.cpp layer offload count; -1 for all, overrides --device",
     )
     parser.add_argument("--max-model-len", type=int, default=16384)
     parser.add_argument("--max-batch-size", type=int, default=32)

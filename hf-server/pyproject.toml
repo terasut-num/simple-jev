@@ -1,4 +1,4 @@
-# Build/install settings for HF; common stays a plain sibling source folder.
+# Build/install settings for the GGUF server; common stays a plain sibling source folder.
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -6,20 +6,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-jev"
 version = "0.1.0"
-description = "Standalone Transformers shared-prefix classifier API"
+description = "Standalone llama.cpp shared-prefix classifier API for GGUF models"
 requires-python = ">=3.12"
-dependencies = ["torch>=2.6", "transformers>=5.16.1,<6", "accelerate>=1", "pydantic>=2", "fastapi", "uvicorn", "numpy"]
+dependencies = ["llama-cpp-python>=0.3.35", "pydantic>=2", "fastapi", "uvicorn", "numpy", "jinja2"]
 
 # Both this command and python -m hf_server call the same entry point.
 [project.scripts]
 simple-jev = "hf_server:main"
 
-# Testing is optional at runtime; tiny-model tests create weights locally.
+# Testing is optional at runtime; the GGUF backend tests use a tiny stubbed
+# engine plus opt-in real-GGUF tests gated by SIMPLE_JEV_GGUF.
 [project.optional-dependencies]
 laya = ["laya==0.3.4"]
 test = ["pytest", "pytest-asyncio", "httpx"]
 
-# Include the shared modules in an HF wheel without introducing a separate
+# Include the shared modules in the wheel without introducing a separate
 # common distribution. Build/install from a checkout containing both folders.
 [tool.setuptools]
 py-modules = ["hf_server"]
