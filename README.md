@@ -1,6 +1,6 @@
 ![Simple Jev Mascot and Logo](./imgs/Simple-Jev-Logo.png)
 
-# Simple Jev Project
+# Simple Jev Project with GGUF implementation
 
 Use compatible open models from huggingface, for structured classification and scoring, without training a separate classifier head.
 
@@ -8,7 +8,10 @@ Explore the demos, playground, and documentation at [simple-jev.featherless.ai](
 
 Send shared context and a set of questions. Simple Jev reads the model's next-token logits for each question and builds a JSON response containing choices, rubric scores, or truth/support judgments. The model does not generate a JSON completion: the server constructs the response from the scores.
 
-The current implementation runs locally with Hugging Face Transformers and PyTorch. Shared request validation, versioned prompt instructions, and response scoring live in the plain Python `common/` folder so other inference implementations can use the same rules.
+The current implementation runs locally with llama.cpp (GGUF models) through
+`llama-cpp-python`, with Vulkan GPU acceleration. Shared request validation,
+versioned prompt instructions, and response scoring live in the plain Python
+`common/` folder so other inference implementations can use the same rules.
 
 ## Try it today
 
@@ -42,7 +45,7 @@ JSON
 
 For production deployments, [Featherless paid plans](https://featherless.ai/) offer higher limits. To run the server yourself, follow the setup below.
 
-## Running the HF Server
+## Running the GGUF Server
 
 Use Python 3.12 or newer. The commands below use Python 3.13.
 
@@ -53,21 +56,24 @@ cd simple-jev
 python3.13 -m venv .venv
 source .venv/bin/activate
 
+# Build llama.cpp with the Vulkan backend for GPU acceleration + Administrator level
+# (requires a C/C++ toolchain and the Vulkan SDK). Omit for CPU-only.
+set CMAKE_ARGS="-DGGML_VULKAN=ON"
+set CMAKE_GENERATOR=Visual Studio 17 2022
+python -m pip install llama-cpp-python --no-cache-dir
+
 # Install the server, including the shared common modules.
 python -m pip install -e './hf-server'
 
-# Start with a small model on CPU.
-python hf-server/hf_server.py \
-  --model Qwen/Qwen3.5-0.8B \
-  --device cpu --dtype float32 \
-  --max-model-len 4096 \
-  --max-batch-size 4 --max-batch-tokens 4096
+# Start with a small GGUF model on CPU.
+python hf-server/hf_server.py --model Qwen/Qwen2.5-0.5B-Instruct-GGUF --gguf-file qwen2.5-0.5b-instruct-fp16.gguf --device cpu --dtype float32 --max-model-len 4096 --max-batch-size 4 --max-batch-tokens 4096
 
-# Alternatively, run Gemma 4 MoE on an NVIDIA GPU with BF16 support.
-# Stop the CPU server first, or choose a different --port.
+# Alternatively, offload every layer to any available GPU backend
+# (Vulkan devices are used automatically when the wheel supports them).
 python hf-server/hf_server.py \
-  --model google/gemma-4-26B-A4B-it \
-  --device cuda --dtype bfloat16 \
+  --model Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+  --gguf-file qwen2.5-0.5b-instruct-fp16.gguf \
+  --device auto --dtype bfloat16 \
   --max-model-len 8192 \
   --max-batch-size 4 --max-batch-tokens 8192
 
@@ -82,9 +88,29 @@ USE_TF=0 python hf-server/hf_server.py \
   --rope-factor 2 --max-model-len 2048
 ```
 
-The first run downloads the model unless it is already cached. A local model directory can also be passed to `--model`. For CUDA or ROCm, install the appropriate PyTorch build for your hardware before installing the server.
+`--model` accepts a local `.gguf` file, a directory containing exactly one
+`.gguf`, or a Hugging Face repository id. For repositories with multiple GGUF
+variants, select one with `--gguf-file NAME.gguf`; only that file is downloaded
+on first run, and the repository identifier remains the request-visible model
+name. For CPU-only builds of llama.cpp, omit `CMAKE_ARGS`.
 
-The GPU example uses [Gemma 4 26B-A4B Instruct](https://huggingface.co/google/gemma-4-26B-A4B-it). Allow memory for the full model weights, KV cache, and inference buffers; sparse expert activation does not mean only the active experts occupy memory. Use `--device auto` to let Transformers place weights across available devices. This is a launch example, not a verified full-size Gemma benchmark.
+The GPU example offloads all layers through llama.cpp's device enumeration:
+with a Vulkan-enabled wheel, weights, KV cache, and flash-attention kernels run
+on the GPU, with CPU fallback when no device is present. Allow memory for the
+full model weights, KV cache, and inference buffers; sparse expert activation
+does not mean only the active experts occupy memory. This is a launch example,
+not a verified full-size benchmark. GPU kernels introduce small floating-point
+differences relative to CPU; use `--device cpu --dtype float32` when scoring
+must be numerically anchored.
+
+CPU execution verifies deterministic llama.cpp scoring, but does not guarantee
+bit-for-bit agreement with the original PyTorch server. `--dtype float32`
+selects the llama.cpp KV-cache precision only; it does not convert GGUF model
+weights. For example, `qwen2.5-0.5b-instruct-fp16.gguf` retains FP16 weights,
+while the original Hugging Face checkpoint may load with a different weight
+precision. Different kernels, weight formats, and accumulation behavior can
+therefore shift raw logits and their softmax probabilities slightly even when
+the prompt, token accounting, and selected answer are the same.
 
 The Laya example loads the specialized Typed Decisions checkpoint. Use `--device cuda` for an NVIDIA GPU, and send `"model": "convaiinnovations/laya"` in API requests. Its default native limit is 1,024 tokens per question. This example explicitly enables experimental 2× linear RoPE interpolation and a 2,048-token sequence budget, including instructions, options, and state. Both full and sliding attention rotary frequencies are halved; the local attention window is unchanged. This enables longer inputs but does not establish accuracy or calibration beyond the checkpoint's training length. Omit `--rope-factor 2` to retain the native behavior. See [Laya backend details](hf-server/README.md#laya-backend).
 
@@ -110,7 +136,7 @@ curl http://127.0.0.1:8000/v1/classifier \
   -H 'Content-Type: application/json' \
   --data-binary @- <<'JSON'
 {
-  "model": "Qwen/Qwen3.5-0.8B",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
   "state": "Mia owns a red bicycle. Her dog is named Max.",
   "questions": {
     "color": {
@@ -132,30 +158,100 @@ curl http://127.0.0.1:8000/v1/classifier \
 JSON
 ```
 
-Question IDs become keys in `answers`. The following response illustrates the shape; the numbers are examples, not promised model outputs:
+Question IDs become keys in `answers`.
+
+### CPU comparison with the original PyTorch server
+
+The following results use the same request. The original server ran the
+Hugging Face `Qwen/Qwen2.5-0.5B-Instruct` checkpoint with PyTorch:
 
 ```json
 {
-  "model": "Qwen/Qwen3.5-0.8B",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "answers": {
+        "color": {
+            "type": "choice",
+            "confidence": 0.877018392086029,
+            "probabilities": {
+                "red": 0.877018392086029,
+                "blue": 0.12298166006803513
+            },
+            "choice": "red"
+        },
+        "support": {
+            "type": "score",
+            "confidence": 0.558726966381073,
+            "probabilities": {
+                "0": 0.05434797331690788,
+                "1": 0.3869251012802124,
+                "2": 0.558726966381073
+            },
+            "score": 1.5043790340423584,
+            "legend": {
+                "0": "Unsupported",
+                "1": "Partially supported",
+                "2": "Fully supported"
+            }
+        },
+        "dog": {
+            "type": "noul",
+            "noul": 0.010005198717117306
+        }
+    },
+    "usage": {
+        "input_tokens": 743,
+        "output_tokens": 0
+    }
+}
+```
+
+The llama.cpp server ran
+`qwen2.5-0.5b-instruct-fp16.gguf` on CPU with `--dtype float32`:
+
+```json
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
   "answers": {
     "color": {
       "type": "choice",
-      "choice": "red",
-      "confidence": 0.95,
-      "probabilities": {"red": 0.95, "blue": 0.05}
+      "confidence": 0.8988586068153381,
+      "probabilities": {
+        "red": 0.8988586068153381,
+        "blue": 0.10114137083292007
+      },
+      "choice": "red"
     },
     "support": {
       "type": "score",
-      "score": 1.75,
-      "confidence": 0.8,
-      "probabilities": {"0": 0.05, "1": 0.15, "2": 0.8},
-      "legend": {"0": "Unsupported", "1": "Partially supported", "2": "Fully supported"}
+      "confidence": 0.6025716662406921,
+      "probabilities": {
+        "0": 0.03482682630419731,
+        "1": 0.36260151863098145,
+        "2": 0.6025716662406921
+      },
+      "score": 1.5677448511123657,
+      "legend": {
+        "0": "Unsupported",
+        "1": "Partially supported",
+        "2": "Fully supported"
+      }
     },
-    "dog": {"type": "noul", "noul": 0.9}
+    "dog": {
+      "type": "noul",
+      "noul": 0.010013843774795523
+    }
   },
-  "usage": {"input_tokens": 600, "output_tokens": 0}
+  "usage": {
+    "input_tokens": 743,
+    "output_tokens": 0
+  }
 }
 ```
+
+Both servers selected `red`, placed `support` toward the third rubric level,
+and reported 743 input tokens. Their probabilities and score differ slightly,
+as expected from the FP16 GGUF weights and differing PyTorch/llama.cpp numeric
+implementations described above.
 
 | Question type | Input criteria | Result |
 | --- | --- | --- |
@@ -198,7 +294,7 @@ curl http://127.0.0.1:8000/v1/classifier \
 JSON
 ```
 
-Unknown top-level request fields are ignored, including completion settings such as `temperature`, `max_tokens`, and `stream`. Unknown fields inside questions and options are rejected. There is no completion sampling or streaming. The HF server currently supports text only; images, audio, video, and tool calls are unsupported.
+Unknown top-level request fields are ignored, including completion settings such as `temperature`, `max_tokens`, and `stream`. Unknown fields inside questions and options are rejected. There is no completion sampling or streaming. The GGUF server currently supports text only; images, audio, video, and tool calls are unsupported.
 
 `usage.input_tokens` counts unique token prefixes within the request, sharing the common context across questions. `usage.output_tokens` is zero because no output tokens are generated. For diagnostic timings, start the server with `ENABLE_OPEN_JEV_ADVANCED_METRICS=1`; adding `"options": {"raw_logits": true}` to a request then includes selected-token logits.
 
@@ -211,8 +307,8 @@ TypeSafe uses “System One” to describe models designed for fast, structured 
 In this implementation, the useful change is how the model is used:
 
 1. The shared prompt builder creates consistent classifier instructions and one scoring branch per question.
-2. The HF server renders those instructions and the context into the model's native chat format.
-3. It evaluates the exact common token prefix once and reuses that prefix's KV cache across batches of question suffixes.
+2. The server renders those instructions and the context into the model's native chat format from the GGUF's chat template.
+3. It decodes the exact common token prefix once and copies those KV cells into per-question sequences for each suffix batch.
 4. It reads the next-token logits for the allowed answer labels. Shared scoring code normalizes those scores and constructs the JSON response.
 
 This avoids generating and parsing a prose or JSON answer token by token. Reusing the context can also reduce repeated computation when several questions refer to the same input. Actual latency depends on the model, hardware, context length, and number of questions. Cache reuse currently lasts only for a single request.
@@ -241,7 +337,7 @@ Shared instructions + context + shared question briefing
                 JSON built by the server
 ```
 
-The KV cache stores the model's attention state for the shared prefix. Each question continues from a copy of that cache with its own suffix and answer prefix. The server batches these suffixes, reads the logits at each row's last real token, and passes the selected label scores to the shared response scorer. Questions do not consume one another's answers.
+The KV pool stores the model's attention state for the shared prefix. Each question continues from a copy of those cells with its own suffix and answer prefix. The server packs these suffixes into batched decodes, reads the logits at each row's last real token, and passes the selected label scores to the shared response scorer. Questions do not consume one another's answers.
 
 For example, suppose four question prompts each contain a 1,000-token common prefix and a 50-token suffix:
 
@@ -250,9 +346,9 @@ For example, suppose four question prompts each contain a 1,000-token common pre
 | Evaluate each complete prompt separately | `4 × (1,000 + 50) = 4,200` |
 | Reuse the shared prefix | `1,000 + 4 × 50 = 1,200` |
 
-If all four suffixes fit in one batch, the shared execution takes one prefix forward pass and one batched suffix forward pass. These token counts illustrate avoided repeated input processing, not a measured latency ratio: each suffix still attends to the cached prefix, and copying caches, padding, and model execution have costs.
+If all four suffixes fit in one batch, the shared execution takes one prefix decode and one batched suffix decode. These token counts illustrate avoided repeated input processing, not a measured latency ratio: each suffix still attends to the cached prefix, and KV copies and model execution have costs.
 
-`--max-batch-size` limits questions per suffix batch; `--max-batch-tokens` limits the number of padded suffix tokens in that batch. Neither limits total model/cache memory or chunks the shared prefix. The current server reuses caches within a request and processes model requests serially. See the [HF execution guide](hf-server/README.md#shared-prefix-execution) for details.
+`--max-batch-size` limits questions per suffix batch; `--max-batch-tokens` limits the number of packed suffix tokens in that batch. Neither limits total model/cache memory or chunks the shared prefix. The current server reuses the KV pool within a request and processes model requests serially. See the [GGUF execution guide](hf-server/README.md#shared-prefix-execution) for details.
 
 ## Shared prompt contract and project layout
 
@@ -260,7 +356,7 @@ If all four suffixes fit in one batch, the shared execution takes one prefix for
 | --- | --- |
 | [`common/`](common/README.md) | Plain Python modules for `ClassifierRequest`, prompt planning, and response scoring. No separate package installation is required. |
 | [`common/PROMPT_STRUCTURE_V1.md`](common/PROMPT_STRUCTURE_V1.md) | Language-independent v1 specification: inputs, prompt strings, chat roles, answer labels, and scoring rules. |
-| [`hf-server/hf_server.py`](hf-server/hf_server.py) | Single-file Transformers implementation: chat rendering, model loading, cached inference, HTTP API, and CLI. |
+| [`hf-server/hf_server.py`](hf-server/hf_server.py) | Single-file llama.cpp implementation: GGUF loading, chat rendering, shared-prefix inference, HTTP API, and CLI. |
 | [`hf-server/API_REFERENCE.md`](hf-server/API_REFERENCE.md) | Detailed request/response contract, validation, diagnostics, and configuration. |
 | [`RFDT/`](RFDT/README.md) | Task-specific decision training: prepare labels, distill teacher estimates, train on answer-token logits, and export a student. |
 
@@ -277,9 +373,9 @@ python -m pip install -e './hf-server[test]'
 python -m pytest -c hf-server/pyproject.toml common/tests hf-server/tests -q
 ```
 
-The tests cover request validation, prompt construction, response scoring, tensor/token mapping, HTTP behavior, and cached-versus-full inference using tiny locally initialized models. They do not require downloading pretrained model weights and do not measure classification accuracy.
+The tests cover request validation, prompt construction, response scoring, tensor/token mapping, HTTP behavior, and shared-prefix-versus-full-prompt inference. The GGUF backend's orchestration tests run against a stubbed engine without any weights; its real-engine tests are opt-in via `SIMPLE_JEV_GGUF` pointing at a local GGUF file. They do not measure classification accuracy.
 
-Models need a supported Transformers implementation, a usable chat template, compatible cache operations, and answer labels that each extend the rendered prompt by exactly one distinct token. The server checks label tokenization; compatibility with every open model is not guaranteed.
+Models need a GGUF file with a usable chat template, a non-recurrent architecture whose KV state can be shared across sequences, and answer labels that each extend the rendered prompt by exactly one distinct token. The server checks label tokenization; compatibility with every open model is not guaranteed.
 
 ## One more thing: Really Fancy Decision Training (RFDT)
 
