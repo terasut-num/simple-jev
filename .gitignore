@@ -11,3 +11,11 @@ demos/jevpilot/node_modules/
 # Track deployment workflows despite the general hidden-file exclusion.
 !.github/
 !.github/**
+
+
+# Environment variables
+.claude
+.venv
+.env
+.env.local
+.env.*.local

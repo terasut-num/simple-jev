@@ -289,7 +289,10 @@ class LlamaCppBackend:
     with logits requested only at each row's final suffix position.
     """
 
-    def __init__(self, model, context, *, max_batch_size=32, max_batch_tokens=32768):
+    def __init__(
+        self, model, context, *, max_batch_size=32, max_batch_tokens=32768,
+        share_prefix=True,
+    ):
         """Bind one loaded model/context and bounds on packed suffix batches.
 
         max_batch_size caps rows per decode and sequence ids (1 + rows must fit
@@ -303,6 +306,10 @@ class LlamaCppBackend:
         self.context = context
         self.max_batch_size = max_batch_size
         self.max_batch_tokens = max_batch_tokens
+        # False makes every branch prefill its own full prompt instead of
+        # copying shared prefix cells, the only strategy that is valid when
+        # llama.cpp cannot duplicate an architecture's rolling state.
+        self.share_prefix = share_prefix
         # Protect the context even if cancellation returns before its thread exits.
         self._lock = threading.Lock()
 
@@ -372,7 +379,11 @@ class LlamaCppBackend:
                 for question in compiled.plan.questions
             }
             # Leave at least one suffix token, including for identical prompts.
-            prefix = common_prefix(sequences)[: min(map(len, sequences)) - 1]
+            prefix = (
+                common_prefix(sequences)[: min(map(len, sequences)) - 1]
+                if self.share_prefix
+                else []
+            )
             memory = self.context.memory
             # Start every request from an empty KV pool: prefix work never
             # persists across requests, so results cannot leak between callers.
@@ -411,8 +422,11 @@ class LlamaCppBackend:
                 # Each row runs on its own sequence id sharing the prefix cells:
                 # the unified cache marks copied cells for both sequences, so
                 # attention sees prefix+suffix without recomputing the prefill.
-                for row in range(len(batch)):
-                    llama_cpp.llama_memory_seq_cp(memory, 0, row + 1, 0, len(prefix))
+                if prefix:
+                    for row in range(len(batch)):
+                        llama_cpp.llama_memory_seq_cp(
+                            memory, 0, row + 1, 0, len(prefix)
+                        )
                 rows = [
                     (row + 1, len(prefix), sequences[i][len(prefix):], True)
                     for row, i in enumerate(batch)
@@ -443,7 +457,9 @@ class LlamaCppBackend:
                 results,
                 {
                     "backend": "llama-cpp",
-                    "prefill_strategy": "shared_prefix",
+                    "prefill_strategy": (
+                        "shared_prefix" if self.share_prefix else "per_branch"
+                    ),
                     "prefix_tokens": len(prefix),
                     "suffix_batch_sizes": sizes,
                     "engine_forwards": decodes,
@@ -1099,6 +1115,7 @@ def load_service(
     max_batch_size=32,
     max_batch_tokens=32768,
     max_request_branches=100,
+    prefix_sharing="auto",
 ):
     """Load a model and return a ready-to-use service, without starting HTTP.
 
@@ -1180,17 +1197,19 @@ def load_service(
     model = _internals.LlamaModel(
         path_model=gguf_path, params=model_params, verbose=False
     )
-    # Recurrent and hybrid architectures carry state that cannot be copied by
-    # llama_memory_seq_cp, so the shared-prefix strategy is impossible for them.
-    if (
+    # Recurrent and hybrid architectures carry rolling state alongside (or
+    # instead of) attention cells. Recent llama.cpp does duplicate that state in
+    # llama_memory_seq_cp, but support varies by architecture and build, so these
+    # models default to per-branch prefill: correct everywhere, and only as
+    # expensive as the prefill it stops sharing. --prefix-sharing opts back in.
+    stateful = bool(
         llama_cpp.llama_model_is_recurrent(model.model)
         or llama_cpp.llama_model_is_hybrid(model.model)
-    ):
+    )
+    if prefix_sharing not in ("auto", "on", "off"):
         model.close()
-        raise ValueError(
-            "This GGUF architecture has recurrent/hybrid state and cannot share "
-            "a prefix KV cache"
-        )
+        raise ValueError(f"Unknown prefix sharing mode: {prefix_sharing}")
+    share_prefix = not stateful if prefix_sharing == "auto" else prefix_sharing == "on"
     n_ctx_train = model.n_ctx_train()
     if max_model_len > n_ctx_train:
         # The engine clamps its own n_ctx to the trained context; admission and
@@ -1222,6 +1241,7 @@ def load_service(
         context,
         max_batch_size=max_batch_size,
         max_batch_tokens=max_batch_tokens,
+        share_prefix=share_prefix,
     )
     return DecisionService(
         model_name,
@@ -1235,6 +1255,8 @@ def load_service(
             "gguf_path": gguf_path,
             "n_gpu_layers": resolved_layers,
             "kv_cache_dtype": dtype,
+            "stateful_architecture": stateful,
+            "prefix_sharing": share_prefix,
             "rope_factor": rope_factor,
         },
     )
@@ -1285,6 +1307,13 @@ def main():
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-batch-tokens", type=int, default=32768)
     parser.add_argument("--max-request-branches", type=int, default=100)
+    parser.add_argument(
+        "--prefix-sharing",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Share prefix KV cells across branches; auto disables it for "
+             "recurrent/hybrid architectures",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = vars(parser.parse_args())
