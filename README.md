@@ -123,7 +123,7 @@ JSON
 
 Question IDs become keys in `answers`.
 
-### CPU comparison with the original PyTorch server from (https://github.com/featherless-ai/simple-jev)[https://github.com/featherless-ai/simple-jev]
+### CPU comparison with the original PyTorch server from [`Original repository`](https://github.com/featherless-ai/simple-jev)
 
 The following results use the same request. The original server ran the
 Hugging Face `Qwen/Qwen3.5-0.8B` checkpoint with PyTorch and A100 (80 GB):
