@@ -64,7 +64,12 @@ python -m pip install llama-cpp-python --no-cache-dir
 python -m pip install -e './hf-server'
 
 # Start with a small GGUF model on CPU.
-python hf-server/hf_server.py --model Qwen/Qwen2.5-0.5B-Instruct-GGUF --gguf-file qwen2.5-0.5b-instruct-fp16.gguf --device cpu --dtype float32 --max-model-len 4096 --max-batch-size 4 --max-batch-tokens 4096
+python hf-server/hf_server.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+  --gguf-file qwen2.5-0.5b-instruct-fp16.gguf \
+  --device cpu --dtype float32 \
+  --max-model-len 4096 \
+  --max-batch-size 4 --max-batch-tokens 4096
 
 # Alternatively, offload every layer to any available GPU backend
 # (Vulkan devices are used automatically when the wheel supports them).
