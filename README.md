@@ -2,14 +2,9 @@
 
 Use compatible open models from huggingface, for structured classification and scoring, without training a separate classifier head.
 
-Explore the demos, playground, and documentation at [simple-jev.featherless.ai](https://simple-jev.featherless.ai/).
-
 Send shared context and a set of questions. Simple Jev reads the model's next-token logits for each question and builds a JSON response containing choices, rubric scores, or truth/support judgments. The model does not generate a JSON completion: the server constructs the response from the scores.
 
-The current implementation runs locally with llama.cpp (GGUF models) through
-`llama-cpp-python`, with Vulkan GPU acceleration. Shared request validation,
-versioned prompt instructions, and response scoring live in the plain Python
-`common/` folder so other inference implementations can use the same rules.
+The current implementation runs locally with llama.cpp (GGUF models) through `llama-cpp-python`, with Vulkan GPU acceleration. Shared request validation,nversioned prompt instructions, and response scoring live in the plain Python `common/` folder so other inference implementations can use the same rules.
 
 ## Running the GGUF Server
 
@@ -17,7 +12,7 @@ Use Python 3.12 or newer. The commands below use Python 3.13.
 
 ```bash
 # Clone the repository and create an environment.
-git clone https://github.com/featherless-ai/simple-jev.git
+git clone https://github.com/terasut-num/simple-jev-llama-cpp.git
 cd simple-jev
 python3.13 -m venv .venv
 source .venv/bin/activate
