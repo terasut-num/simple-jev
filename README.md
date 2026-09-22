@@ -11,38 +11,6 @@ The current implementation runs locally with llama.cpp (GGUF models) through
 versioned prompt instructions, and response scoring live in the plain Python
 `common/` folder so other inference implementations can use the same rules.
 
-## Try it today from demo API
-
-Try the [public demo API](https://simple-jev-demo-api.featherless.ai/v1/) with **no login, API key, or authentication required**. The demo has a **2k-token context limit** and is **rate limited to 2 requests per second (2 RPS)**.
-
-First, list the available models with `GET /v1/models`:
-
-```bash
-curl https://simple-jev-demo-api.featherless.ai/v1/models
-```
-
-The demo already serves Gemma as `featherless-ai/gemma-4-26B-A4B-classifier`. Try it directly with `POST /v1/classifier`, or use another model ID returned by the list:
-
-```bash
-curl https://simple-jev-demo-api.featherless.ai/v1/classifier \
-  -H 'Content-Type: application/json' \
-  --data-binary @- <<'JSON'
-{
-  "model": "featherless-ai/gemma-4-26B-A4B-classifier",
-  "state": "Mia owns a red bicycle.",
-  "questions": {
-    "color": {
-      "type": "choice",
-      "instructions": "What color is Mia's bicycle?",
-      "criteria": {"red": null, "blue": null}
-    }
-  }
-}
-JSON
-```
-
-For production deployments, [Featherless paid plans](https://featherless.ai/) offer higher limits. To run the server yourself, follow the setup below.
-
 ## Running the GGUF Server
 
 Use Python 3.12 or newer. The commands below use Python 3.13.
@@ -57,8 +25,8 @@ source .venv/bin/activate
 # Build llama.cpp with the Vulkan backend for GPU acceleration + Administrator level
 # (requires a C/C++ toolchain and the Vulkan SDK). Omit for CPU-only.
 set CMAKE_ARGS="-DGGML_VULKAN=ON"
-set CMAKE_GENERATOR=Visual Studio 17 2022
-python -m pip install llama-cpp-python --no-cache-dir
+python -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan
+python -m pip install -r requirements.txt
 
 # Install the server, including the shared common modules.
 python -m pip install -e './hf-server'
