@@ -211,7 +211,7 @@ The llama.cpp server ran `Qwen3.5-0.8B-BF16.gguf` on GPU (RTX 4060) with `--dtyp
 ```
 
 Both servers selected `red`, placed `support` toward the third rubric level,
-and reported 743 input tokens. Their probabilities and score differ slightly,
+and reported 796 input tokens. Their probabilities and score differ slightly,
 as expected from the FP16 GGUF weights and differing PyTorch/llama.cpp numeric
 implementations described above.
 
