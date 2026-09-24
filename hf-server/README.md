@@ -313,15 +313,20 @@ approximately equal, not identical.
 With a GPU-enabled wheel (for example Vulkan), `--device cpu` keeps the weights
 on the host but llama.cpp still *offloads operations* for batches of 32 or more
 tokens to the GPU (`op_offload`, on by default): the startup log shows a
-`Vulkan0 compute buffer`. For hybrid models such as `qwen35` this also disables
-the fused chunked Gated Delta Net kernel (`fused Gated Delta Net (chunked) not
-supported, set to disabled`), so splitting a prompt across decodes rounds
-slightly differently than decoding it at once. The server keeps llama.cpp's
-default here, so results stay comparable with earlier runs on the same machine;
-for a strictly CPU reference use a CPU-only `llama-cpp-python` build. The
-real-engine fidelity test disables op offload itself when
-`SIMPLE_JEV_DEVICE=cpu`. On Windows consoles, set `PYTHONUTF8=1` to avoid
-harmless `UnicodeEncodeError` warnings from llama-cpp-python's log callback.
+non-zero `Vulkan0 compute buffer`. The server keeps llama.cpp's default, so
+results stay comparable with earlier runs on the same machine; for a strictly
+CPU reference use a CPU-only `llama-cpp-python` build. The real-engine fidelity
+test disables op offload itself when `SIMPLE_JEV_DEVICE=cpu`.
+
+Recurrent and hybrid models (e.g. `qwen35`) have one more batch effect, on CPU
+too: llama.cpp slices packed sequences into equal-length sub-batches, so a
+question row packed with longer rows has its recurrent state computed in several
+pieces instead of one pass. Its scores then differ slightly from scoring that
+prompt alone (about 0.03 logits on Qwen3.5-0.8B-BF16), with either
+`--prefix-sharing` mode. Scores are still deterministic for the same request
+and settings; rows of equal length are unaffected. On Windows consoles, set
+`PYTHONUTF8=1` to avoid harmless `UnicodeEncodeError` warnings from
+llama-cpp-python's log callback.
 
 ## Scope and validation
 

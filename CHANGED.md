@@ -310,31 +310,43 @@ Hugging Face downloads were blocked in this environment, so real-engine checks u
 
 Not validated here: real-weight accuracy, GPU/Vulkan execution, and a full `prompt_search.py` run (the TypeSafe quick dataset requires preparation from a blocked host).
 
-### 9.5 Follow-up: fidelity test on a Vulkan wheel with a hybrid model
+### 9.5 Follow-up: fidelity test with a hybrid model (Qwen3.5-0.8B-BF16)
 
 User run on Windows (Python 3.14, Vulkan-enabled llama-cpp-python, RTX 4060),
 `SIMPLE_JEV_GGUF=Qwen3.5-0.8B-BF16.gguf`: 132 passed, 7 skipped, 1 failed:
 `test_shared_prefix_scores_match_independent_decodes` diverged by 0.028 logits
-(tolerance 1e-3). Neither the test nor `LlamaCppBackend` changed in this merge.
+(tolerance 1e-3). Neither that test nor `LlamaCppBackend` changed in this merge,
+and the test had previously been validated only on a dense model (§6).
 
-Cause: the test forces sharing and ran with `n_gpu_layers=0`, but llama.cpp's
-default `op_offload` still schedules batches of 32+ tokens on Vulkan. The
-64-token probe for the fused chunked Gated Delta Net kernel therefore lands on
-Vulkan0 while the `qwen35` layer is on CPU, and llama.cpp disables that kernel
-("fused Gated Delta Net (chunked) not supported, set to disabled"). The hybrid
-model then mixes unfused chunked (multi-token) and fused autoregressive
-(one-token) recurrence kernels, so the prefix-then-suffix decode and the
-single full decode round differently. The same test passes on a CPU-only build,
-including against a tiny random-weight `qwen35` hybrid GGUF built for this check.
+First diagnosis (wrong): llama.cpp's default `op_offload` moves batches of 32+
+tokens to Vulkan even with `n_gpu_layers=0`, which also disabled the fused
+chunked Gated Delta Net kernel. That offload is real, so the test now disables it
+under `SIMPLE_JEV_DEVICE=cpu`, but a pure-CPU rerun (no Vulkan compute buffer,
+fused kernels enabled) still diverged: 0.0287 with prefix sharing and 0.0262 with
+per-branch prefill.
 
-Change (test only; server numerics untouched so results stay comparable):
-- With `SIMPLE_JEV_DEVICE=cpu` the test context sets `op_offload = False`, making
-  it a genuine CPU reference as documented.
-- It is parametrized over both server prefill strategies (`shared_prefix`,
-  `per_branch`) and asserts the reported `prefill_strategy`.
-- Non-CPU devices use the documented GPU tolerance (0.15) instead of 1e-3.
-- Mutation check: reading the wrong row's logits makes both strategies diverge
-  by roughly 10–13 logits, so both tolerances still detect real errors.
+Actual cause: recurrent/hybrid memory in llama.cpp slices a packed batch into
+equal-length sub-batches. With the test's uneven suffixes (lengths 2, 3, 1), each
+longer row's recurrence is computed in several pieces rather than in one pass as
+in the single-sequence reference, which rounds differently. Reproduced on CPU
+with random-weight `qwen35` hybrid GGUFs at realistic width (hidden 512, 8
+layers): uneven rows drifted by 0.001 (F32) through the backend, and by up to
+0.135 in full-vocabulary logits (BF16) when packed directly, while equal-length
+rows matched within 1e-5 on both strategies. Small F32 models hid the effect.
+Both prefill strategies score correctly; the drift is the same whether or not
+the prefix is shared, and it predates this merge.
+
+Changes (test and docs only; server numerics untouched, so results stay
+comparable with the pre-merge server):
+- The test checks both `--prefix-sharing` strategies and asserts the reported
+  `prefill_strategy`.
+- Attention-only models keep the strict 1e-3 check on uneven rows.
+  Recurrent/hybrid models must match within 1e-3 on equal-length rows and within
+  0.1 on uneven rows. Non-CPU devices use the documented GPU tolerance (0.15).
+- With `SIMPLE_JEV_DEVICE=cpu` the test context sets `op_offload = False`.
+- Mutation check: reading the wrong row's logits diverges by about 10 logits
+  (dense) and 30 (hybrid), so every tolerance still detects real errors.
+- `hf-server/README.md` precision notes describe both effects.
 
 Prompt identity for the documented Qwen3.5-0.8B example was also re-checked:
 compiled with the pre-merge (`0583a0c`) and merged servers, the token IDs,
