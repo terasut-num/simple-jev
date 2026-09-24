@@ -309,3 +309,35 @@ Hugging Face downloads were blocked in this environment, so real-engine checks u
 - Live CLI server: `/health` and `/v1/models` report the served name; a request naming another model returned 422 under `--enforce-model-id`; chat under a named format returned upstream's 422; `eval/run.py` on SemIf-authored completed 144/144 rows and `eval/audit.py` verified 144 examples.
 
 Not validated here: real-weight accuracy, GPU/Vulkan execution, and a full `prompt_search.py` run (the TypeSafe quick dataset requires preparation from a blocked host).
+
+### 9.5 Follow-up: fidelity test on a Vulkan wheel with a hybrid model
+
+User run on Windows (Python 3.14, Vulkan-enabled llama-cpp-python, RTX 4060),
+`SIMPLE_JEV_GGUF=Qwen3.5-0.8B-BF16.gguf`: 132 passed, 7 skipped, 1 failed:
+`test_shared_prefix_scores_match_independent_decodes` diverged by 0.028 logits
+(tolerance 1e-3). Neither the test nor `LlamaCppBackend` changed in this merge.
+
+Cause: the test forces sharing and ran with `n_gpu_layers=0`, but llama.cpp's
+default `op_offload` still schedules batches of 32+ tokens on Vulkan. The
+64-token probe for the fused chunked Gated Delta Net kernel therefore lands on
+Vulkan0 while the `qwen35` layer is on CPU, and llama.cpp disables that kernel
+("fused Gated Delta Net (chunked) not supported, set to disabled"). The hybrid
+model then mixes unfused chunked (multi-token) and fused autoregressive
+(one-token) recurrence kernels, so the prefix-then-suffix decode and the
+single full decode round differently. The same test passes on a CPU-only build,
+including against a tiny random-weight `qwen35` hybrid GGUF built for this check.
+
+Change (test only; server numerics untouched so results stay comparable):
+- With `SIMPLE_JEV_DEVICE=cpu` the test context sets `op_offload = False`, making
+  it a genuine CPU reference as documented.
+- It is parametrized over both server prefill strategies (`shared_prefix`,
+  `per_branch`) and asserts the reported `prefill_strategy`.
+- Non-CPU devices use the documented GPU tolerance (0.15) instead of 1e-3.
+- Mutation check: reading the wrong row's logits makes both strategies diverge
+  by roughly 10–13 logits, so both tolerances still detect real errors.
+
+Prompt identity for the documented Qwen3.5-0.8B example was also re-checked:
+compiled with the pre-merge (`0583a0c`) and merged servers, the token IDs,
+answer-token IDs, labels, and `usage.input_tokens` are identical, and
+Qwen3.5-0.8B (24 layers, hidden 1024) is not a profiled size, so omitting
+`--classifier-prompt-policy` still resolves to `baseline`.

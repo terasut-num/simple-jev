@@ -310,6 +310,19 @@ implementation is **not** guaranteed on GPU. Use `--device cpu --dtype
 float32` when scoring must be numerically anchored; treat GPU results as
 approximately equal, not identical.
 
+With a GPU-enabled wheel (for example Vulkan), `--device cpu` keeps the weights
+on the host but llama.cpp still *offloads operations* for batches of 32 or more
+tokens to the GPU (`op_offload`, on by default): the startup log shows a
+`Vulkan0 compute buffer`. For hybrid models such as `qwen35` this also disables
+the fused chunked Gated Delta Net kernel (`fused Gated Delta Net (chunked) not
+supported, set to disabled`), so splitting a prompt across decodes rounds
+slightly differently than decoding it at once. The server keeps llama.cpp's
+default here, so results stay comparable with earlier runs on the same machine;
+for a strictly CPU reference use a CPU-only `llama-cpp-python` build. The
+real-engine fidelity test disables op offload itself when
+`SIMPLE_JEV_DEVICE=cpu`. On Windows consoles, set `PYTHONUTF8=1` to avoid
+harmless `UnicodeEncodeError` warnings from llama-cpp-python's log callback.
+
 ## Scope and validation
 
 This reference currently accepts **text only**, including text messages.

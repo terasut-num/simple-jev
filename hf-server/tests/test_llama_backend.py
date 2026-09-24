@@ -312,8 +312,19 @@ def build_real_service(gguf, **kwargs):
 
 
 @real_engine
-async def test_shared_prefix_scores_match_independent_decodes():
-    """Backend scores equal independent full-prompt decodes on the same context."""
+@pytest.mark.parametrize("share_prefix", [True, False], ids=["shared_prefix", "per_branch"])
+async def test_shared_prefix_scores_match_independent_decodes(share_prefix):
+    """Backend scores equal independent full-prompt decodes on the same context.
+
+    Both prefill strategies the server can select (--prefix-sharing) are
+    checked. With SIMPLE_JEV_DEVICE=cpu the context also disables op offload:
+    a GPU-enabled wheel (e.g. Vulkan) otherwise moves batches of 32+ tokens to
+    the GPU even with zero offloaded layers, which also switches hybrid models
+    (qwen35) off the fused chunked Gated Delta Net kernel. Mixing kernel
+    variants between the split and unsplit decodes then differs by a few
+    hundredths of a logit, which is float rounding rather than a sharing error.
+    On other devices, the documented GPU precision tolerance applies instead.
+    """
     import llama_cpp
 
     llama_cpp.llama_backend_init()
@@ -325,6 +336,8 @@ async def test_shared_prefix_scores_match_independent_decodes():
     context_params.n_batch = 512
     context_params.n_seq_max = 4
     context_params.kv_unified = True
+    if DEVICE == "cpu":
+        context_params.op_offload = False
     context = _internals.LlamaContext(
         model=model, params=context_params, verbose=False
     )
@@ -370,8 +383,11 @@ async def test_shared_prefix_scores_match_independent_decodes():
                    [], "")
             for i in range(3)
         ]
-        result = await LlamaCppBackend(model, context).score(
+        result = await LlamaCppBackend(model, context, share_prefix=share_prefix).score(
             CompiledRequest(plan, branches)
+        )
+        assert result.metrics["prefill_strategy"] == (
+            "shared_prefix" if share_prefix else "per_branch"
         )
         worst = 0.0
         for i, question in enumerate(plan.questions):
@@ -383,7 +399,9 @@ async def test_shared_prefix_scores_match_independent_decodes():
                 for label in question.output_labels
             ]
             worst = max(worst, max(abs(a - b) for a, b in zip(got, reference[i])))
-        assert worst < 1e-3, f"shared-prefix scores diverged by {worst}"
+        # CPU is the numerical reference; GPU kernels deviate by up to ~0.1.
+        tolerance = 1e-3 if DEVICE == "cpu" else 0.15
+        assert worst < tolerance, f"{result.metrics['prefill_strategy']} scores diverged by {worst}"
     finally:
         context.close()
         model.close()
