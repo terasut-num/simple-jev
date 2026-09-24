@@ -1693,7 +1693,8 @@ input:focus-visible {
   .demo-feature-copy {
     padding: 24px;
   }
-  .site-header nav a.demos-nav {
+  .site-header nav a.demos-nav,
+  .site-header nav a.eval-nav {
     display: inline-flex;
   }
 }

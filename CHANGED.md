@@ -257,3 +257,55 @@ decode. Raise `--max-model-len` above the real prompt length, or use
   reporting `stateful_architecture=True` and `prefix_sharing` following the
   selected mode.
 - `--help` still loads no weights.
+
+---
+
+## 9. Upstream sync: model discovery, prompt formats, 255-option Choice, quick-eval search
+
+Date: 2026-09-24
+Scope: merge of `featherless-ai/simple-jev` `main` up to `5686b21` ("Add model-aware prompt defaults, quick search, and classifier limits"), including the earlier upstream commits this fork had not yet taken (evaluation suites and audits, named prompt policies, website/evaluation pages). The llama.cpp/GGUF engine from §1–§8 is unchanged; upstream's Transformers-specific loading was translated to GGUF.
+
+### 9.1 Taken from upstream unchanged
+
+- `common/`: Choice accepts 2–255 options; above 50, `prepare_prompt` takes adapter-supplied, tokenizer-validated two-letter labels (`AA`, `AB`, …). Requests with ≤50 options render exactly as before.
+- `hf-server/hf_prompt_policies.py` (new, unmodified): the `baseline`, `examples_binary`, `repeat_state`, and `strict_mix_repeat2` formats, binary Noul restoration, and the architecture/size profile table (`KNOWN_PROFILES`) with `resolve_prompt_policy`.
+- Service/HTTP behaviour in `hf_server.py`: `GET /v1/models` discovery (no inference slot, `x_max_choice_options`), a public `--served-model-name`, permissive request model IDs by default with opt-in `--enforce-model-id` (error text is now `Served model is …`), responses always naming the served model, `--max-choice-options` (2–255) enforced independently of `--max-request-branches`, `PromptCompiler` prompt policies/extended labels, and `Branch.reasoning_content` / `CompiledRequest.binary_noul_keys`.
+- `eval/`: full suites, presets, audits, comparisons, the sequential quick-eval `prompt_search.py`, and their offline tests; `.github/workflows/test-evaluations.yml`; `scripts/export_eval_page.py`; website evaluation pages.
+- Upstream tests `test_auto_policy.py`, `test_discovery_choices.py`, `test_prompt_policies.py`, and the `test_api.py`/`test_laya.py` updates.
+
+### 9.2 Adapted for GGUF / llama.cpp
+
+| Upstream (Transformers) | This fork (GGUF) |
+| --- | --- |
+| Profile read from HF `config.json` via `AutoConfig` | `read_gguf_metadata` parses the GGUF header (keeping the per-layer arrays llama.cpp's own metadata view drops) and `gguf_backbone_config` maps it onto the same fingerprint fields: `qwen35`/`qwen35moe`/`gemma4` → HF text model types, `block_count − nextn_predict_layers`, `key_length_swa` as Gemma 4's `head_dim`, sliding-layer `head_count_kv`, `expert_*`, vocabulary size. Unprofiled architectures appear as `gguf:<arch>` and fall back to `baseline` with upstream's warning. |
+| `tokenizer.apply_chat_template(..., continue_final_message=True)` | `LlamaCppTokenizer` reproduces Transformers 5.x exactly: a sentinel appended to the final message's last text block, render, cut at the sentinel. `enable_thinking` and `reasoning_content` pass through to the GGUF Jinja template. |
+| `tokenizer.all_special_ids` | `LlamaCppTokenizer.all_special_ids`: tokens with the llama.cpp `CONTROL` attribute, scanned once on first use. |
+| Choice capacity checked before `from_pretrained` loads weights | A vocabulary-only llama.cpp load (`vocab_only=True`) fingerprints the header, resolves the policy, and checks two-letter label capacity before any weights load. |
+| A template that drops the fixed prefill is rejected per request | The same rejection happens at startup: a sample request (`STARTUP_PROBE_REQUEST`) is compiled with the resolved policy, and failure stops startup with guidance. |
+| `prompt_search.py` launches the Transformers server | It launches the GGUF server; adds `--gguf-file`, `--n-gpu-layers`, `--prefix-sharing`, `--chat-template-file` (all fixed across formats); local `.gguf` paths stay local and are recorded by size; offline pinning looks up the cached `--gguf-file`; provenance lists `llama-cpp-python` instead of torch/transformers. |
+
+New in this fork: `--chat-template-file` replaces the GGUF's embedded template for every request (metadata `chat_template_source`), because GGUF conversions often embed templates that predate the reasoning prefill. `load_service` now validates `--prefix-sharing` and `--device` before touching any file, and closes the model if context creation fails. Advanced metadata adds `prompt_policy`, `prompt_policy_selection`, and `chat_template_source`.
+
+Behaviour change to note: with no `--classifier-prompt-policy`, a recognized Qwen3.5/Gemma 4 GGUF now starts with its recommended named format, which accepts `state` only. Pass `--classifier-prompt-policy baseline` to keep the previous prompts and chat `messages` support. Unrecognized models (for example Qwen2.5) behave as before, after a startup warning.
+
+### 9.3 Tests
+
+- The three upstream loader tests that mocked `transformers.Auto*.from_pretrained` were rewritten against `conftest.fake_gguf_loader`, which records llama.cpp model/context parameters while `load_service` runs its real control flow.
+- New `test_gguf_policies.py`: header reader (arrays kept, string arrays skipped, bad magic), all five profiles resolved from converter-style GGUF headers (plus near-size and unknown-architecture fallbacks), `continue_final_message` trailing-space and error handling, parity with Transformers' renderer when `transformers` is installed, control-token IDs, startup probe rejection without loading weights, template override, and CLI pass-through.
+- New real-engine test (opt-in `SIMPLE_JEV_GGUF`): discovery, served name, and a 64-option Choice over HTTP.
+- `eval/tests/test_prompt_search.py`: GGUF flags and local-file/offline GGUF revision pinning.
+- Removed the stale `tests/test_hf_backend.py`, which §4 already listed as removed; it imported the deleted `HFBackend` and only passed because it skipped without torch.
+
+### 9.4 Validation (2026-09-24, Linux, Python 3.11, CPU, llama-cpp-python 0.3.35 built from source)
+
+Hugging Face downloads were blocked in this environment, so real-engine checks used GGUF files built from llama.cpp's own vocabulary fixtures: the real Qwen2 vocabulary with the Qwen3.5-4B and Qwen2.5-7B chat templates, and the real Gemma 4 26B-A4B vocabulary with its embedded template, around small random-weight llama-architecture blocks. Tokenization and chat rendering are production-real; answers are not meaningful.
+
+- `python -m pytest -c hf-server/pyproject.toml common/tests hf-server/tests -q`: 150 passed, 14 skipped (torch-only, Transformers-parity, and `SIMPLE_JEV_GGUF` tests); the 4 parity tests also pass with `transformers` installed.
+- With `SIMPLE_JEV_GGUF` set to each of the three GGUFs: all 8 `test_llama_backend.py` tests pass, including shared-prefix vs independent full-prompt decode fidelity (with the Qwen3.5-template file, the whole `hf-server/tests` suite: 133 passed, 7 skipped).
+- `python -m unittest discover -s eval -p 'test_*.py'`: 87 tests OK.
+- Rendering parity: every branch compiled for all four formats, for state and chat requests including a 60-option Choice, rendered identically through `LlamaCppTokenizer` and Transformers 5.17's `render_jinja_template` (0 mismatches across the Qwen3.5, Qwen2.5, and Gemma 4 templates).
+- End to end: the Qwen3.5-template GGUF served all four formats for a combined request with a 255-option Choice (255 probabilities returned). The Qwen2.5 template (no text-block content) and the Gemma 4 templates tried (llama.cpp's fixture, `google-gemma-4-31B-it.jinja`, and its `-interleaved` variant, which render reasoning only alongside tool calls) were rejected at startup for the named formats and served `baseline`.
+- The real Gemma 4 26B-A4B GGUF header resolves to upstream's `Gemma MoE 26B-A4B` profile (`strict_mix_repeat2`).
+- Live CLI server: `/health` and `/v1/models` report the served name; a request naming another model returned 422 under `--enforce-model-id`; chat under a named format returned upstream's 422; `eval/run.py` on SemIf-authored completed 144/144 rows and `eval/audit.py` verified 144 examples.
+
+Not validated here: real-weight accuracy, GPU/Vulkan execution, and a full `prompt_search.py` run (the TypeSafe quick dataset requires preparation from a blocked host).

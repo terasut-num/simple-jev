@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f8f9f6" />
+  <meta name="description" content="Compare Jev, Qwen and Gemma on public JevBench, decision benchmarks and 63,372 vision questions. Explore score breakdowns, real questions and recorded answers." />
+  <title>Evaluations — Simple Jev</title>
+  <link rel="icon" type="image/png" href="assets/simple-jev.png" />
+  <link rel="stylesheet" href="styles.css?v=20260918-how-button" />
+  <link rel="stylesheet" href="evaluations.css" />
+  <script type="module" src="evaluations.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to evaluations</a>
+  <header class="site-header wrap">
+    <a class="wordmark" href="index.html" aria-label="Simple Jev home"><img class="brand-logo" src="assets/simple-jev.png" alt="Simple Jev" width="64" height="64" /></a>
+    <a class="built-by header-credit" href="https://featherless.ai/" aria-label="Built by Featherless.ai"><span>Built by</span><img src="assets/featherless_logo_dark.svg" alt="Featherless.ai" width="156" height="51" /></a>
+    <nav aria-label="Main navigation">
+      <a class="demos-nav" href="demos.html">Cool demos</a>
+      <a class="playground-nav" href="playground.html">Playground</a>
+      <a class="eval-nav" href="evaluations.html" aria-current="page">Evaluations</a>
+      <a class="docs-link" href="docs.html">API docs</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="index.html#rfdt">RFDT</a>
+      <a class="nav-github" href="https://github.com/featherless-ai/simple-jev">GitHub <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+  <main id="main" class="wrap eval-page">
+    <section aria-labelledby="title">
+      <p class="eyebrow">OPEN MODELS · STRUCTURED DECISIONS</p>
+      <h1 id="title">Decisions, measured.</h1>
+      <p class="eval-lead">Jev against five open models. Start with the scores, then open the benchmarks to see what they actually test.</p>
+      <div id="load-status" role="status">Loading the frozen evaluation snapshot…</div>
+      <p class="scroll-hint">Swipe the table → to compare scores and prompt formats.</p>
+      <div class="eval-scroll" tabindex="0" role="region" aria-label="Model comparison, scroll horizontally on small screens">
+        <table class="headline-table">
+          <caption>Accuracy comparison · higher is better · click a score heading to rank</caption>
+          <thead><tr>
+            <th scope="col">Rank</th><th scope="col">Model</th><th scope="col">Preferred prompt format</th>
+            <th scope="col" id="public-heading" aria-sort="descending"><button type="button" data-sort="publicCorrect">JevBench public set ↓<small>231 decisions · prompt-selection run¹</small></button></th>
+            <th scope="col" id="decision-heading" aria-sort="none"><button type="button" data-sort="decisionScore">Decision benchmarks<small>33,099 questions · 26-item mean²</small></button></th>
+            <th scope="col" id="vision-heading" aria-sort="none"><button type="button" data-sort="visionScore">Vision benchmarks<small>63,372 questions · 7-config mean³</small></button></th>
+          </tr></thead>
+          <tbody id="leaderboard"></tbody>
+        </table>
+      </div>
+      <p class="comparison-legend">Green highlights scores above Jev. Grey marks the baseline; wins, losses and ties are labelled per benchmark. Blue marks vision results, which have no Jev baseline. “pp” means percentage points—not statistical significance.</p>
+      <div class="eval-notes">
+        <p><strong>¹ JevBench public set.</strong> Jev’s baseline is <strong>200/231 (86.58%)</strong>. All 231 decisions count equally. Qwen/Gemma scores use their preferred prompt formats, selected on this development set—<strong>not held-out accuracy</strong>.</p>
+        <p><strong>² Decision benchmarks.</strong> Accuracy is the equal-weight mean of 26 English project/configuration/category items, not pooled accuracy or an average of category averages. Jev’s baseline is <strong>87.15%</strong>. Each column is a separate evaluation.</p>
+        <p><strong>³ Vision benchmarks.</strong> Equal-weight mean of per-question accuracy across seven configurations. Native MME points and POPE F1 are shown separately below, not mixed into this average. Jev has no measured vision result in this evaluation.</p>
+      </div>
+      <p class="eval-jumps"><a href="#public-set">Explore public questions ↓</a><a href="#decision-set">Explore decision benchmarks ↓</a><a href="#vision-set">Explore vision benchmarks ↓</a><a href="#methodology">Methodology &amp; sources ↓</a></p>
+    </section>
+
+    <details id="public-set" class="eval-section">
+      <summary><span><span class="eyebrow">01 / JEVBENCH</span><span class="section-title">The original public question set</span><span class="section-subtitle">231 released decisions · difficulty, family and question-type breakdowns</span><span class="section-action when-closed">Click to expand: see the original JevBench dataset questions</span></span><span class="expand-mark"><span class="when-closed">View breakdown</span><span class="when-open">Hide breakdown</span><span class="disclosure-chevron" aria-hidden="true">⌄</span></span></summary>
+      <div class="section-body">
+        <p>48 easy, 72 “original” (standard-tier), and 111 hard decisions. “Original” is also the name of the 72-question tier: it is not the whole public set. The published 534-decision benchmark includes unavailable held-out/imported items; this page does not reproduce that leaderboard or its weighted composite.</p>
+        <p class="eval-notes"><strong>Replication note.</strong> Our Jev endpoint rerun scored <strong>199/231 (86.15%)</strong>; we could not replicate the published <strong>200/231 (86.58%)</strong> in that run. The comparison table and public-set breakdowns retain the published 200/231 baseline.</p>
+        <label class="eval-control">Break down by <select id="public-dimension"><option value="tier">Difficulty tier</option><option value="family">Task family</option><option value="primitive">Question type</option></select></label>
+        <div class="eval-scroll" tabindex="0" role="region" aria-label="Public-set breakdown"><table id="public-breakdown"></table></div>
+        <h3>Questions &amp; recorded answers</h3>
+        <p>Browse all 231 actual cases—not just wins. Jev’s source publishes correct/incorrect outcomes, not answer labels; those labels are never invented here.</p>
+        <div class="eval-controls">
+          <label class="eval-control">Tier<select id="example-tier"><option value="all">All tiers</option><option value="easy">Easy</option><option value="original">Original</option><option value="hard">Hard</option></select></label>
+          <label class="eval-control">Question type<select id="example-type"><option value="all">All types</option><option value="choice">Choice</option><option value="score">Score</option><option value="noul">Noul</option></select></label>
+          <label class="eval-control">Outcome<select id="example-outcome"><option value="all">All outcomes</option><option value="miss">At least one model incorrect</option></select></label>
+        </div>
+        <p id="examples-status" role="status">Examples load when this section is opened.</p>
+        <div class="example-navigation">
+          <button id="previous-example" type="button" disabled aria-label="Previous example">← Previous</button>
+          <label class="eval-control">Question<select id="example-id" disabled></select></label>
+          <button id="next-example" type="button" disabled aria-label="Next example">Next →</button>
+        </div>
+        <div id="public-example"></div>
+      </div>
+    </details>
+
+    <details id="decision-set" class="eval-section">
+      <summary><span><span class="eyebrow">02 / DECISION BENCHMARKS</span><span class="section-title">Beyond a single question set</span><span class="section-subtitle">33,099 scored questions · 21,364 examples · 26 matched English items</span><span class="section-action when-closed">Click to expand: see the expanded question set across domains</span></span><span class="expand-mark"><span class="when-closed">View breakdown</span><span class="when-open">Hide breakdown</span><span class="disclosure-chevron" aria-hidden="true">⌄</span></span></summary>
+      <div class="section-body">
+        <p>All six models have matched coverage: 33,099 scored questions across 21,364 input examples, grouped into 26 items across six domains. Each item contributes 1/26 of the headline score, regardless of its row count. Knowledge, ranking, vision, and non-English results are excluded. Some items contain several suites or multiple binary decisions per input row.</p>
+        <h3>Domain breakdown</h3>
+        <p>Each domain shows the mean of its constituent items. Domains contain different numbers of items, so averaging these six percentages does not reproduce the headline.</p>
+        <div class="eval-scroll" tabindex="0" role="region" aria-label="Decision domain breakdown"><table id="category-breakdown"></table></div>
+        <div class="eval-controls">
+          <label class="eval-control">Domain<select id="decision-category"><option value="all">All domains</option></select></label>
+          <label class="eval-control search-control">Find a benchmark<input type="search" id="decision-search" placeholder="e.g. legal, SemIf, tool…" /></label>
+        </div>
+        <p id="decision-status" role="status"></p>
+        <div id="decision-items"></div>
+      </div>
+    </details>
+
+    <details id="vision-set" class="eval-section">
+      <summary><span><span class="eyebrow">03 / VISION BENCHMARKS</span><span class="section-title">Decisions grounded in images</span><span class="section-subtitle">63,372 questions per model · seven configurations · recognition, perception, hallucination and counting</span><span class="section-action when-closed">Click to expand: see the various questions with images</span></span><span class="expand-mark"><span class="when-closed">View breakdown</span><span class="when-open">Hide breakdown</span><span class="disclosure-chevron" aria-hidden="true">⌄</span></span></summary>
+      <div class="section-body">
+        <p>Five image-capable models completed the same seven configurations with no failed rows. Jev has no measured vision result here: “—” means unavailable, not zero, and no model is labelled as beating Jev on vision.</p>
+        <p><strong>Why three POPE variants?</strong> They share the same underlying images but choose absent objects differently: random samples objects randomly, popular uses frequent objects, and adversarial uses objects that often co-occur with those present. The examples below intentionally use three different images and absent-object questions to illustrate the variants.</p>
+        <h3>Accuracy breakdown</h3>
+        <p>The headline is a page-specific summary: the arithmetic mean of seven per-question accuracies, not pooled accuracy or an official combined leaderboard score. The three POPE variants each receive one-seventh weight. MME’s native score (out of 2,000) and POPE’s native F1 are preserved inside the item details.</p>
+        <p class="vision-key"><strong>Blue highlighting</strong> marks the highest measured accuracy in each row; equal best scores share the highlight. Jev is shown at the far right as not evaluated. Inside each breakdown, native metrics have their own winners.</p>
+        <div class="eval-scroll" tabindex="0" role="region" aria-label="Vision accuracy breakdown"><table id="vision-breakdown"></table></div>
+        <p>The selected text prompt formats were transferred to vision without a separate vision prompt search. These measurements used the image-capable evaluation implementation. Image-builder now supports native messages and images with named prompt policies; image availability depends on the deployed build and model.</p>
+        <div id="vision-items"></div>
+      </div>
+    </details>
+
+    <details id="methodology" class="eval-section">
+      <summary><span><span class="eyebrow">04 / READ THE FINE PRINT</span><span class="section-title">Methodology &amp; sources</span><span class="section-subtitle">What these numbers mean—and what they do not</span></span><span class="expand-mark"><span class="when-closed">View methodology</span><span class="when-open">Hide methodology</span><span class="disclosure-chevron" aria-hidden="true">⌄</span></span></summary>
+      <div class="section-body methodology">
+        <h3>Scoring</h3>
+        <p>Public JevBench uses pinned upstream scoring: Choice and Score select the highest-probability label, with lexicographic tie-breaking. Score does not round the expected numeric score. Noul maps to P(yes) and 1−P(yes). Invalid answers and request failures count as wrong. No tier, cost, speed or calibration weighting is applied.</p>
+        <p>The decision suite uses its own adapter definitions, explained under each item. In particular, labelled binary batteries use a ≥0.5 threshold, and the choice/typed adapters resolve ties in fixture order. This is not a claim that every suite has identical scoring semantics.</p>
+        <h3>Prompt policies, not newly trained models</h3>
+        <p>Qwen3.8-27B uses <code>examples_binary</code>; Qwen3.6-35B-A3B uses <code>repeat_state</code>; both Gemmas and Qwen3.5-4B use <code>strict_mix_repeat2</code>. These policies change instructions, examples, repetition and Noul formatting, not model weights. The fixed Choice prefill is not a generated scratchpad. These are structured-classifier measurements, not general chat leaderboard results.</p>
+        <h3>Selection and overlap</h3>
+        <p>Prompt selection used a 477-case development set: JevBench 231, authored SemIf 144 and TypeSafe 102. The broader decision evaluation overlaps those datasets and is not a wholly held-out test. A later full run can differ from a selected quick run; the columns intentionally preserve their separate run provenance. No significance, latency or throughput ranking is implied.</p>
+        <h3>Examples are evidence, not explanations invented by a model</h3>
+        <p>Public examples include saved predicted labels for Qwen/Gemma and published correctness outcomes for Jev. Decision-item examples show the dataset’s gold answer, not a fabricated model response. One short case from the first constituent suite is selected for readability, not as a representative estimate of model quality. Full context is available inside each example. Dataset content is displayed as text, never executed.</p>
+        <h3>Download and audit</h3>
+        <ul>
+          <li><a href="assets/evaluations/results.json" download>Score snapshot, item definitions, examples and SHA-256 source manifest (JSON)</a></li>
+          <li><a href="assets/evaluations/public-examples.json" download>All 231 public questions, gold labels and recorded outcomes (JSON)</a></li>
+          <li><a href="https://github.com/fstandhartinger/jevbench/tree/83831807458d7df424a1e53e5724f3a3ffe2cf89">Pinned public JevBench source ↗</a> · <a href="https://github.com/fstandhartinger/jevbench/blob/83831807458d7df424a1e53e5724f3a3ffe2cf89/results/v1.2/jevbench-v1.2-per-task.json">Published Jev per-task outcomes ↗</a> · <a href="assets/evaluations/LICENSE-jevbench.txt">MIT license</a></li>
+        </ul>
+        <p>The export cross-checks suite definitions against <code>simple-jev-eval</code>. Broader scores come from <code>FULL_EVAL_FINAL_COMPARISON.json</code>, with matching row counts for every item/model. Source paths in the manifest identify local experiment artifacts; they are not public download URLs. The bundled snapshot is sufficient to reproduce the displayed aggregates, not to rerun inference. This page makes no inference calls.</p>
+      </div>
+    </details>
+    <noscript><p class="eval-notes">JavaScript is required for interactive scores and examples. Download the <a href="assets/evaluations/results.json">evaluation snapshot</a> to inspect the data without JavaScript.</p></noscript>
+    <footer class="eval-footer"><a href="index.html">← Simple Jev</a><a href="playground.html">Try your own questions →</a></footer>
+  </main>
+</body>
+</html>

@@ -427,3 +427,41 @@ async def test_gguf_service_end_to_end_http():
             assert "confidence" in body["answers"]["color"]
     service.backend.context.close()
     service.backend.model.close()
+
+@real_engine
+async def test_gguf_discovery_served_name_and_extended_choice_http():
+    """Discovery, served names, and >50-option Choice through the real tokenizer."""
+    import httpx
+
+    from hf_server import create_app
+
+    service = build_real_service(
+        GGUF, max_model_len=8192, served_model_name="public-gguf", prompt_policy="baseline"
+    )
+    options = {f"item-{i}": None for i in range(64)}
+    payload = {
+        "model": "any-name",
+        "state": "The requested item is item-7.",
+        "questions": {
+            "item": {"type": "choice", "instructions": "Which item?", "criteria": options},
+            "small": {"type": "choice", "instructions": "Pick one.",
+                      "criteria": {"a": None, "b": None}},
+        },
+    }
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(service)), base_url="http://t"
+        ) as client:
+            models = (await client.get("/v1/models")).json()["data"]
+            assert [(m["id"], m["x_max_choice_options"]) for m in models] == [("public-gguf", 255)]
+            response = await client.post("/v1/classifier", json=payload)
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["model"] == "public-gguf"
+            probabilities = body["answers"]["item"]["probabilities"]
+            assert list(probabilities) == list(options)
+            assert sum(probabilities.values()) == pytest.approx(1, abs=1e-6)
+            assert len(body["answers"]["small"]["probabilities"]) == 2
+    finally:
+        service.backend.context.close()
+        service.backend.model.close()
