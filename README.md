@@ -243,7 +243,7 @@ curl http://127.0.0.1:8000/v1/classifier \
   -H 'Content-Type: application/json' \
   --data-binary @- <<'JSON'
 {
-  "model": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+  "model": "unsloth/Qwen3.5-0.8B-GGUF",
   "state": "Mia owns a red bicycle. Her dog is named Max.",
   "questions": {
     "color": {
@@ -312,7 +312,7 @@ Hugging Face `Qwen/Qwen3.5-0.8B` checkpoint with PyTorch and A100 (80 GB):
 }
 ```
 
-The llama.cpp server ran `Qwen3.5-0.8B-BF16.gguf` on GPU (RTX 4060) with `--dtype float32`:
+The llama.cpp server ran `Qwen3.5-0.8B-BF16.gguf` on GPU (RTX 4060) with `--dtype float32 --classifier-prompt-policy baseline`:
 
 ```json
 {
