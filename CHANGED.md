@@ -348,6 +348,13 @@ comparable with the pre-merge server):
   (dense) and 30 (hybrid), so every tolerance still detects real errors.
 - `hf-server/README.md` precision notes describe both effects.
 
+Real-weight validation after this change (user's Windows machine, Python 3.14,
+Vulkan-enabled llama-cpp-python 0.3.35, `SIMPLE_JEV_DEVICE` unset = `cpu`,
+`PYTHONUTF8=1`), `python -m pytest -c hf-server/pyproject.toml hf-server/tests -q`:
+- `SIMPLE_JEV_GGUF=Qwen3.5-0.8B-BF16.gguf` (hybrid `qwen35`): 134 passed, 7 skipped.
+- `SIMPLE_JEV_GGUF=qwen2.5-0.5b-instruct-fp16.gguf` (attention-only `qwen2`):
+  134 passed, 7 skipped.
+
 Prompt identity for the documented Qwen3.5-0.8B example was also re-checked:
 compiled with the pre-merge (`0583a0c`) and merged servers, the token IDs,
 answer-token IDs, labels, and `usage.input_tokens` are identical, and
