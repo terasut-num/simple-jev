@@ -1,181 +1,312 @@
-# Endpoint evaluation suites
+# Endpoint evaluations
 
-Run SemIf-derived fixtures against any implementation accepting the Jev-shaped
-`model`, `state`, `questions` request and returning `answers.decision.probabilities`.
-Python 3.10+, standard library only. No Transformers, GPU runtime, or weights are
-required on the evaluator machine. The model runs on the endpoint's machine.
+Run benchmarks against a Jev-compatible classifier endpoint accepting `model`,
+`questions`, and either `state` (text) or image-bearing `messages` (vision).
+Python 3.10+; the runner and offline tests use only the standard library.
+Models run on the endpoint, so the evaluator needs no GPU.
 
-## Included baseline
+## Run
 
-- `data/authored144.jsonl`: SemIf's complete project-authored 144-row fixture.
-- `vendor/semif/build_typesafe.py`: original verified-snapshot builder for its
-  102-row TypeSafe subset, plus the original selection manifest and MIT license.
-- No TypeSafe documents or model weights are bundled.
+From the repository root:
 
-Source: https://github.com/TheoLeeCJ/SemIf
-Pinned revision: `ca3ba65f142967030ecb453346e94d6f476a69df`.
-Vendored files are unmodified. The authored dataset is synthetic and model-reviewed,
-not human-adjudicated. TypeSafe's 102 rows span 20 selected cases, not its full
-711-case benchmark. This is a first baseline, not SemIf's entire 706-row suite.
+```sh
+python3 eval/run.py \
+  --endpoint http://localhost:8000/v1/classifier \
+  --model YOUR_MODEL \
+  --suite eval/suites/english/semif-authored.json \
+  --output eval/results/first-run
+```
 
-## Qwen 2B and 4B runs (on the GPU node)
+Repeat `--suite` to run multiple benchmarks. For authentication, set a bearer key
+in your environment and pass `--key-env JEV_API_KEY`. Use a new output directory
+for each run. The included SemIf fixture needs no preparation; other datasets may.
 
-Start your preferred backend separately. It must expose the classifier contract;
-an ordinary chat-completions endpoint is not sufficient. Pass the exact served
-model ID, which may differ from the Hugging Face ID. These example IDs assume
-Qwen3.5 2B and 4B are served under their upstream names. Change them if you meant
-another Qwen generation or use endpoint aliases.
+## Prompt-format search
+
+`prompt_search.py` orchestrates **local GGUF serving** through
+`hf-server/hf_server.py` (llama.cpp), unlike the ordinary endpoint-only runner.
+Install the GGUF-server dependencies (`llama-cpp-python`, built with Vulkan for
+GPU use) in the interpreter used to launch it, prepare all three quick datasets,
+and provide sufficient hardware:
+
+```sh
+python eval/prompt_search.py --model /models/YOUR_MODEL.gguf --list  # offline, no downloads
+python eval/prompt_search.py --model /models/YOUR_MODEL.gguf --device auto --dtype bfloat16 \
+  --max-model-len 32768 --output eval/results/my-prompt-search
+# Hugging Face GGUF repository: pick one file and pin the commit.
+python eval/prompt_search.py --model ORG/MODEL-GGUF --gguf-file MODEL-Q4_K_M.gguf \
+  --revision COMMIT_SHA --device auto --output eval/results/my-gguf-search
+```
+
+The search always passes explicit policies; server auto-selection cannot influence
+which candidate is tested. Defaults: `baseline examples_binary repeat_state
+strict_mix_repeat2`, 477 decisions each, workers=1, no request retries, 32K context,
+255-option limit. Remote branches/revisions are resolved once to an immutable
+commit before loading weights; offline mode requires the cached `--gguf-file`
+(or `config.json`) for that revision. Local `.gguf` files and GGUF directories
+are recorded by path and size in `search.json` and must be kept unchanged during
+the search. Pass `--revision COMMIT` to reproduce a specific checkpoint.
+
+- `--policies baseline examples_binary` searches a subset; tied best formats use
+  this order. The default prefers baseline on ties.
+- `--device cpu --dtype float32` supports CPU testing (numerically anchored
+  llama.cpp scoring); four full quick runs can be slow. The model is reloaded once
+  per format. `--dtype` is the KV-cache type; GGUF weights keep their quantization.
+- `--gguf-file`, `--n-gpu-layers`, `--prefix-sharing` (default `auto`), and
+  `--chat-template-file` are passed unchanged to every format's server, so all
+  formats run the same weights, offload, prefill strategy, and chat template. A
+  format the GGUF's template cannot render fails at server startup and is
+  reported as incomplete; supply `--chat-template-file` to include it.
+- `--max-model-len`, `--max-choice-options`, `--max-batch-size`,
+  `--max-batch-tokens`, and `--workers` stay fixed across formats. Increase context
+  when needed; the tool never truncates candidates or skips difficult cases.
+- `--port` (default 8179) must be unused. The server binds loopback only, uses a
+  unique served ID with strict ID checking, and is terminated after each run.
+  Existing servers are never adopted or stopped.
+- `--startup-timeout` (1800s), `--request-timeout` (300s), and `--eval-timeout`
+  (14400s per policy) bound execution. Failures, timeouts, and interruptions retain
+  their logs/results. Output directories must be new; no overwrite or resume.
+
+Each policy directory contains `server.log`, deployment/command metadata, the
+normal `eval/` raw responses and native summaries, `audit.log`, and `result.json`.
+`search.json` records source/data hashes, resolved checkpoint revision, GGUF
+file selection, local weight sizes, chat-template hash, settings, and
+package/platform information (including `llama-cpp-python`). Record accelerator details separately when
+publishing results. Native response/coverage audits must pass before a run is
+eligible. `comparison.json` ranks **pooled native correct/477**, using JevBench's
+native accuracy and SemIf per-row accuracy—not the equal-case headline or the
+full decision macro. Other native metrics remain in each suite summary.
+
+If any requested format is incomplete, the command exits nonzero and emits **no
+recommended policy**, although it shows the best complete candidates. Successful
+ties are reported explicitly. Apply the winner with
+`--classifier-prompt-policy POLICY`; the tool does not edit model profiles or
+server defaults. These are development-selection results, not held-out estimates,
+and quick does not validate 255-option accuracy. Use disjoint evaluation data for
+claims about generalization.
+
+## Portable presets and full reproduction
+
+| Preset | Selection |
+| --- | --- |
+| `quick` | 231 native JevBench + 144 Authored + 102 TypeSafe = 477 decisions |
+| `decision` | 20 English suites, covering the 26 matched decision items |
+| `full-text` | 65 non-overlapping text suites: 86,747 input examples |
+| `vision` | Seven configurations: 63,372 questions |
+| `full` | `full-text` plus `vision`, without duplicate parent/child suites |
+
+The full selections are pinned in `full-suites.json`. They retain the historical
+BigCloneBench and ToolRet Web exclusions. The larger catalog also includes
+opt-in suites and disjoint category partitions; **do not run every manifest**
+or mix `quick` with the full JevBench tier suites, which reuse the same decisions.
+The 477 cases were used for prompt development/selection, not held-out testing.
+
+```sh
+# No network, credentials, model, or dataset downloads needed to inspect a plan.
+python3 eval/run.py --preset quick --list
+python3 eval/run.py --preset full --list
+
+# Build TypeSafe first using the verified upstream snapshots described below.
+python3 eval/run.py --preset quick \
+  --endpoint http://localhost:8000/v1/classifier --model YOUR_MODEL \
+  --delay 0 --output eval/results/model-quick
+
+# After preparing ALL selected datasets, substitute decision/full-text/vision/full.
+python3 eval/run.py --preset decision \
+  --endpoint http://localhost:8000/v1/classifier --model YOUR_MODEL \
+  --workers 4 --delay 0 --output eval/results/model-decision
+
+# Replays saved raw responses, checks exact source/ID coverage, and rescores offline.
+python3 eval/audit.py --run eval/results/model-decision --preset decision
+
+# Reproduce the equal-item decision aggregate, retaining native report metrics.
+python3 eval/compare.py --mode decision \
+  --report Model=eval/results/model-decision/report.json \
+  --output eval/results/decision-comparison.json
+```
+
+`--list` reports dataset-file presence, **not** validation or asset completeness.
+Execution validates all selected data/images before sending requests. Missing
+sources fail explicitly; there is no synthetic replacement, silent truncation,
+or silent suite skipping. Preparation commands and dataset-specific optional
+packages are documented in [notes/README.md](notes/README.md). TypeSafe source
+records and large downloaded text/image corpora are deliberately not bundled;
+obtain them under their upstream terms. The authored and native public JevBench
+fixtures are included and need no preparation.
+
+Start the model server separately, with an explicit startup prompt policy. The
+runner neither picks policies from model names nor installs runtime hooks. See
+[GGUF server startup configuration](../hf-server/README.md). Record the model revision,
+policy, server revision, precision, and hardware in a non-secret JSON object and
+optionally pass `--deployment-info FILE`; this is saved provenance, **not** a
+server configuration request or verification of the remote deployment. Resume
+requires identical supplied metadata, evaluator dependencies, data and settings.
+
+Use an endpoint capable of the selected protocol: native Choice/Score/Noul,
+image-bearing messages for vision, sufficient untruncated context, and (for
+some full-suite ranking tasks) up to 255 candidates. The HF classifier now defaults
+to `--max-choice-options 255`; this is a server capability, not an evaluator-side
+truncation or workaround. Older servers may still cap Choice at 50. Check the
+configured limit via `/v1/models`. HF named policies currently support text/state
+requests only. A backend capacity rejection is a failure,
+not permission to shrink the benchmark. Do not point bulk runs at the limited
+public demo. No GPU accuracy run, backend parity claim, or performance change
+is part of this tooling migration.
+
+For controlled model comparisons, start HF with `--enforce-model-id` and send the
+served ID from `/v1/models`. The permissive default accepts arbitrary request IDs;
+it does not select or load that model. When using `--served-model-name`, record the
+physical checkpoint and revision separately in `--deployment-info`.
+The option cap does not increase the context budget: repeated-input policies can
+need a larger `--max-model-len` (for example, 32768) for 255-option cases.
+Overlong prompts are rejected, never truncated.
+
+`compare.py --mode quick` pools the 477 decisions; `--mode decision` uses the
+26 matched English items; `--mode text` reports the 54 matched knowledge,
+decision and ranking items separately. `--mode vision` averages the seven
+per-question accuracies and preserves native MME points/POPE F1 separately.
+Repeat `--report NAME=PATH` for models. Comparisons reject missing items,
+failures, incomplete coverage, and mismatched question counts. They check
+**report metadata**, not raw evidence: run `audit.py` first for every model.
+Historical Jev references under `benchmarks/` are not new endpoint measurements.
+The 26-item decision **comparison** contains 21,364 input examples and 33,099
+scored questions; multi-label tasks account for the difference. The `decision`
+preset keeps the mixed CodeMMLU parent intact for honest project-wide coverage,
+so it also executes 11,501 CodeMMLU knowledge examples, excluded from that
+aggregate (32,865 input examples executed in total).
+
+Private cloud submission, saved job handles, experiment-only backend patches,
+model caches and raw run archives are not required or copied. HTTP concurrency,
+resume and repair work locally against separately managed endpoints. Historical
+archive paths in benchmark provenance identify old evidence, not dependencies
+of the portable CLI. See [migration provenance](PORTING.md).
+
+## Prepare and browse
+
+```sh
+python3 eval/prepare.py --help
+python3 eval/prepare.py knowledge --help
+python3 eval/catalog.py                    # Our category splits
+python3 eval/catalog.py --view project     # Named benchmark projects
+python3 eval/catalog.py --write-doc        # Generate both catalogs in notes/
+```
+
+Converters download only when explicitly requested and never call models.
+See the [benchmark notes](notes/README.md) for sources and preparation commands.
+
+## Results
+
+Runs save predictions, scoring inputs, provenance, and per-suite summaries.
+`by-category.md` and `by-project.md` provide the two reporting views. Full project
+scores are recomputed from examples, not averages of category scores.
+
+```sh
+python3 eval/report.py --run eval/results/first-run --view project
+```
+
+See [reporting](notes/REPORTING.md) for coverage, partial runs, and combining runs.
+
+## Layout
+
+| Path | Purpose |
+| --- | --- |
+| `run.py`, `retry.py`, `report.py` | Execute, resume, repair and report HTTP evaluations |
+| `presets.py`, `full-suites.json` | Frozen quick/full selections |
+| `audit.py`, `compare.py` | Replay completion evidence and compare matched metrics |
+| `prepare.py`, `preparation/` | Dataset preparation CLI and converters |
+| `catalog.py`, `taxonomy.json`, `suites/` | Benchmark definitions and grouping |
+| `suites.py`, `adapters/` | Dataset loading, request mapping, and metrics |
+| `tests/` | Offline checks |
+| `notes/` | Detailed documentation and generated catalogs |
+| `vendor/` | Pinned source metadata, fixtures, and upstream licenses |
+| `data/` | Small committed fixtures; prepared datasets are ignored |
+| `sources/`, `results/` | Ignored downloads and run artifacts |
+
+```sh
+python3 -m unittest discover -s eval -p 'test_*.py'
+```
+
+For the request contract, custom adapters, and baseline details, see the
+[framework reference](notes/FRAMEWORK.md).
+
+For long runs, `--workers 16 --delay 0.02` allows up to 16 concurrent requests,
+with at least 20 ms between dispatches. Choose settings appropriate to your
+endpoint. `--resume` continues an interrupted output directory with identical
+settings/data, preserving every saved prediction (including failures). A malformed
+partial JSONL record requires review rather than automatic deletion.
+
+The runner pauses on authentication/billing rejection or 20 consecutive errors.
+Retries apply to HTTP 429 and all HTTP 5xx server errors. Context-free questions send an
+empty string for `state`, compatible with System One's non-null input contract.
+
+Export small, tracked reports per project with `report.py --export`; see
+[report storage](notes/REPORTING.md#store-benchmark-reports-in-git).
+
+BigCloneBench is opt-in because it contains 415,416 examples. Full-run selectors
+should skip manifests with `default_enabled: false`; explicit `--suite` selection
+still works. Other coding benchmarks remain in the default set.
+
+To repair saved server failures after a run finishes:
+
+```sh
+python3 eval/retry.py --run eval/results/first-run --key-env JEV_API_KEY
+```
+
+Omit `--key-env` for an unauthenticated local endpoint. Keep prepared images at
+their original location for repair: saved asset bindings are restored and every
+image checksum is revalidated before requests.
+
+Only HTTP 5xx failures are retried. Successful predictions are preserved, original
+failures are retained in `prior_results` and a retry journal, and scores are rebuilt.
+Do not retry a run while another process is writing to it.
+
+ToolRet Web is also disabled by default: its full candidate descriptions can exceed
+32K context. ToolRet Code and Customized remain enabled; no silent truncation is applied.
+
+## JevBench public accuracy
+
+`jevbench-public` contains the 231 released decisions at upstream revision
+`83831807458d7df424a1e53e5724f3a3ffe2cf89`: 48 easy, 72 original (public
+standard-tier items), and 111 hard. The published 534-decision run also includes
+held-out/imported items unavailable here; no judge-tier items are public.
+This suite is the public subset, not a reproduction of that full leaderboard.
 
 ```sh
 python eval/run.py --endpoint http://127.0.0.1:8000/v1/classifier \
-  --suite eval/suites/semif-authored.json \
-  --model Qwen/Qwen3.5-2B --output eval/results/qwen35-2b-authored
-
-# After loading the 4B model, or use a second endpoint:
-python eval/run.py --endpoint http://127.0.0.1:8000/v1/classifier \
-  --suite eval/suites/semif-authored.json \
-  --model Qwen/Qwen3.5-4B --output eval/results/qwen35-4b-authored
+  --model Qwen/Qwen3.5-4B --suite eval/suites/jevbench-public.json \
+  --delay 0 --output eval/results/qwen35-4b-jevbench-public
 ```
 
-For a System One compatible service, use its complete `/v1/systemone` URL.
-For authentication, export the key in your shell and pass `--key-env JEV_API_KEY`.
-Keys are never written to run files. Use HTTPS for remote authenticated services.
+The `jevbench-accuracy-v1` adapter preserves native choice, score and Noul
+requests, including criteria order. Only state and the question's type,
+instructions and criteria go to the endpoint. Labels, expected answers and
+provenance stay local. It works with compatible classifier endpoints;
+prompting remains endpoint-owned.
 
-The runner sends only state, question, and option descriptions. Gold labels,
-reference distributions and provenance are never sent. All rows use `choice`,
-including binary rows, preserving SemIf's candidate-probability experiment.
-This does **not** evaluate the endpoint's native Noul or Score primitives or
-force SemIf's internal prompts. Backend prompting remains implementation-specific.
-One row per call makes this a quality baseline, not a shared-prefix throughput test.
+The headline is **unweighted accuracy: correct / scorable requested decisions**.
+Each question counts once; no tier/family weighting, cost, speed, calibration,
+or composite score is calculated. Summaries include correct counts, coverage
+and accuracy by tier, family and primitive without averaging those breakdowns.
+HTTP failures, context overflow and invalid distributions count wrong. All
+bundled rows have gold answers; custom rows with `expected: null` are reported
+as unscorable and excluded from accuracy, but still included in coverage.
 
-## Optional TypeSafe subset
+Pinned upstream `scoring.py` supplies per-item semantics: choice and score use
+argmax probabilities (score does **not** round the expected numeric score),
+Noul maps `noul` to P(yes) and its complement to P(no). Exact ties use the
+lexicographically smallest label, unlike the SemIf adapter's fixture-order tie
+rule. Complete finite distributions are required, with upstream strict 0.1%
+and accepted rounding 2% sum tolerances. The response's claimed choice/score
+is not substituted for its distribution. There is no input truncation or RoPE
+change in the evaluator.
 
-Obtain the four official public case files locally and name them:
+**Published Jev 1.13.0 reference on these exact IDs: 200/231 = 86.58%.**
+Easy:48/48; original:71/72; hard:81/111. Derived from upstream's public per-task
+outcomes, not the weighted90.4% full-benchmark score or a new endpoint run.
+`vendor/jevbench/jev-public-reference.json` records the outcomes and source hash.
 
-- `eval/sources/typesafe-security_incidents-cases.js`
-- `eval/sources/typesafe-agent_trace_observability-cases.js`
-- `eval/sources/typesafe-invoice_processing-cases.js`
-- `eval/sources/typesafe-customer_service-cases.js`
-
-Source URLs follow `https://evals.typesafe.ai/<workflow>-cases.js`.
-These are third-party records; their redistribution terms are not supplied here.
-The upstream builder rejects changed snapshots using the pinned manifest hashes.
-Do not remove that check to silently evaluate a different subset.
-
-```sh
-python eval/vendor/semif/build_typesafe.py \
-  --source-dir eval/sources \
-  --selection eval/vendor/semif/source-selection.jsonl \
-  --output eval/data/typesafe102.jsonl
-
-python eval/run.py --endpoint http://127.0.0.1:8000/v1/classifier \
-  --suite eval/suites/semif-typesafe.json \
-  --model Qwen/Qwen3.5-4B \
-  --output eval/results/qwen35-4b-typesafe
-```
-
-Repeat with the 2B served model ID. The builder also retains TypeSafe's published
-model distributions; these are historical references, not fresh endpoint runs.
-
-## Output and interpretation
-
-Each run has a directory per suite, containing `manifest.json`,
-`predictions.jsonl`, and `summary.json`. A root `summary.json` collects suite
-reports separately; it never averages unrelated benchmarks into one score. Existing output directories are rejected. Predictions are flushed
-after each row; interrupted runs retain partial evidence, but have no final summary.
-The manifest records dataset and runner SHA-256, endpoint, model ID, and settings.
-Record backend revision, precision, hardware, and prompt version alongside a run
-when comparing implementations; those are not inferable from an arbitrary endpoint.
-
-Metrics:
-
-- Accuracy over all requested rows.
-- Mean family balanced accuracy: mean per-class recall within each family,
-  then equal-weight mean across families (the authored baseline headline).
-- Equal-case modal agreement: mean row accuracy within each `group_id`, then mean
-  across cases (the TypeSafe subset headline).
-- Equal-case total variation to reference distributions, only for successful
-  rows with a reference. Its denominator is reported separately.
-
-Missing/invalid responses count as wrong for agreement/accuracy. All labels must
-be present, values finite and in [0,1], with sum within 2% of one; accepted values
-are renormalized. Argmax ties select the first option in fixture order. A run with
-any failed rows exits nonzero. Do not compare incomplete distribution metrics
-against complete baseline results.
-
-Requests are serial with a default 300 ms gap and 120 s timeout. HTTP 429/502/503/504
-receive up to three retries with exponential delay and numeric Retry-After support
-(up to 120 s). Network/validation failures are recorded without automatic retries.
-Elapsed time includes retries and is client wall time, not GPU inference time.
-
-No model evaluations have been run for this addition. Unit checks, when desired:
-
-```sh
-python -m unittest discover -s eval -p 'test_*.py'
-```
-
-## Adding and combining evaluations
-
-`run.py` owns HTTP execution, retries and artifacts. `suites.py` loads versioned
-suite manifests. `adapters/choice.py` owns choice-row validation, request mapping,
-response interpretation and metrics. No SemIf-specific branching exists in the
-transport runner. `vendor/semif/` is source preparation, not the runner.
-
-Run multiple prepared suites against one model:
-
-```sh
-python eval/run.py --endpoint http://gpu-node:8000/v1/classifier \
-  --model Qwen/Qwen3.5-4B \
-  --suite eval/suites/semif-authored.json \
-  --suite eval/suites/semif-typesafe.json \
-  --output eval/results/qwen35-4b-multiple
-```
-
-All selected datasets are validated before any HTTP calls. The optional TypeSafe
-suite must be built first. Repeat the command with another model and a new output
-directory to compare models on exactly the same suite versions and dataset hashes.
-
-For a new choice benchmark:
-
-1. Add a JSONL file with the row format below (or a preparation script).
-2. Add a JSON manifest under `suites/`, selecting `choice-v1`.
-3. Specify its source/revision and meaningful headline metric. Increment the suite
-   version when changing selection, label mapping or scoring interpretation.
-4. Pass its manifest via `--suite`; no runner edits are needed.
-
-Minimal JSONL row (one object per line):
-
-```json
-{"id":"routing-001","group_id":"scenario-001","family":"routing","state":"Please refund my duplicate charge.","question":"Which queue?","options":[{"id":"billing","description":"Billing support"},{"id":"technical","description":"Technical support"}],"label":0}
-```
-
-`label` is a zero-based option index. `target_distribution` is optional and follows
-option order. Group related paraphrases under the same `group_id`; `family` defines
-balanced-accuracy aggregation. Labels and provenance remain local.
-
-Suite manifest (dataset path is relative to this manifest):
-
-```json
-{
-  "schema_version": 1,
-  "id": "support-routing",
-  "version": "1",
-  "adapter": "choice-v1",
-  "dataset": "../data/support-routing.jsonl",
-  "headline_metric": "mean_family_balanced_accuracy",
-  "source": {"description": "Our held-out support routing cases"}
-}
-```
-
-For a different task format or metrics, add a trusted local adapter and register
-it in `suites.py`'s `ADAPTERS`. Its interface is:
-
-- `validate(rows)`: reject invalid input before endpoint calls.
-- `request_for(row, model)`: build the endpoint request without gold labels.
-- `parse_response(row, response)`: return validated prediction fields.
-- `summarize(rows, records)`: return metrics, including `failed_rows`.
-
-Rows must have a unique string `id`; other fields belong to the adapter. Responses
-and errors are retained in records. Native Noul, ordinal scores, chat histories,
-or composed workflow evals can use their own adapters. Currently only `choice-v1`
-is implemented; the extension point does not imply these tasks are supported yet.
+The fixtures retain every original field and add only `tier`; upstream source
+hashes are in `vendor/jevbench/source-manifest.json`. Pinned upstream scoring is
+unmodified, with its MIT license retained. Sources:
+https://github.com/fstandhartinger/jevbench/tree/83831807458d7df424a1e53e5724f3a3ffe2cf89
+and `datasets/public/{easy,original,hard}.jsonl` at that revision.

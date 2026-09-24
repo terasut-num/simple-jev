@@ -13,8 +13,10 @@ Request flow:
     llama.cpp: ClassifierRequest -> PromptCompiler -> LlamaCppBackend -> common.build_response
     Laya: ClassifierRequest -> LayaBackend -> native encoder scoring -> response
 
-common owns validation, versioned classifier wording, label semantics, and answer
-math. This file owns text-only role assembly, native chat/tokenizer boundaries,
+common owns validation, default versioned classifier wording, label semantics,
+and answer math. hf_prompt_policies adds startup-selected formatting and binary Noul
+adaptation without modifying common. This file owns text-only role assembly,
+native chat/tokenizer boundaries,
 shared-prefix inference, queue/cancellation controls, usage accounting, HTTP, and
 startup. Model weights load only when load_service/main is called.
 
@@ -25,7 +27,7 @@ tokens: it scores the next-token logits of each branch's answer boundary.
 
 The sections below follow the data flow and retain the implementation notes for
 KV ownership, per-row logit selection, and asynchronous cleanup. Tests live in
-tests/; no separate simple_jev package or duplicate classifier template is needed.
+tests/; no separate simple_jev package or duplicate baseline template is needed.
 """
 
 import argparse
@@ -59,6 +61,10 @@ from common import (
     prepare_prompt,
 )
 from common.prompt_builder import DEFAULT_TEMPLATE_VERSION, canonical
+from hf_prompt_policies import (
+    KNOWN_PROFILES, PROFILE_FIELDS, PROMPT_POLICIES, format_branch, prepare_policy,
+    restore_binary_noul, validate_policy, resolve_prompt_policy,
+)
 
 # Shared plan to native chat and tokens
 
@@ -71,6 +77,7 @@ class Branch:
     prefix. output_ids contains the next-token vocabulary IDs, in the same order
     as the shared question's output_labels. Messages/prefix remain available for
     inspection; they are not reconstructed from tokens during inference.
+    reasoning_content is an optional fixed native assistant prefill, not output.
 
     render_only compilation leaves both ID lists empty and is not executable.
     frozen prevents attribute reassignment, not mutation of the contained lists.
@@ -81,6 +88,7 @@ class Branch:
     output_ids: list[int]
     messages: list[dict]
     answer_prefix: str
+    reasoning_content: str | None = None
 
 
 @dataclass
@@ -90,10 +98,13 @@ class CompiledRequest:
     Keep this pair together until response scoring: branch IDs and output order
     must be interpreted against the plan that created them. Branch order initially
     matches plan order; the backend may reorder execution for efficient padding.
+    binary_noul_keys identifies temporary Choice questions that the HF response
+    adapter must restore to Noul after common scores their no/yes logits.
     """
 
     plan: PromptPlan
     branches: list[Branch]
+    binary_noul_keys: tuple[str, ...] = ()
 
 
 def common_prefix(sequences):
@@ -116,15 +127,48 @@ def common_prefix(sequences):
 class PromptCompiler:
     """Render shared classifier plans with a model's native tokenizer template."""
 
-    def __init__(self, tokenizer, max_tokens=16384, version=DEFAULT_TEMPLATE_VERSION):
+    def __init__(self, tokenizer, max_tokens=16384, version=DEFAULT_TEMPLATE_VERSION, prompt_policy="baseline", max_choice_options=255):
         """Store the renderer, complete-prompt token limit, and shared version.
 
         Version validation is performed by common.prepare_prompt during compile.
+        Named prompt policies are startup-selected HF formatting/scoring adaptations.
         This class does not load a tokenizer or model on its own.
         """
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
         self.version = version
+        validate_policy(prompt_policy)
+        self.prompt_policy = prompt_policy
+        if type(max_choice_options) is not int or not 2 <= max_choice_options <= 255:
+            raise ValueError("max_choice_options must be between 2 and 255")
+        self.max_choice_options = max_choice_options
+        self._extended_choice_labels = None
+
+    def validate_choice_capacity(self):
+        """Allocate fixed-width labels; every real prompt is checked again below."""
+        if self.max_choice_options <= 50:
+            return ()
+        if self._extended_choice_labels is None:
+            import itertools
+            import string
+            boundary = '{"answer": "'
+            prefix = self.tokenizer.encode(boundary, add_special_tokens=False)
+            labels, seen = [], set()
+            special = set(getattr(self.tokenizer, 'all_special_ids', ()))
+            for pair in itertools.product(string.ascii_uppercase, repeat=2):
+                label = ''.join(pair)
+                ids = self.tokenizer.encode(boundary + label, add_special_tokens=False)
+                if (len(ids) == len(prefix) + 1 and ids[:-1] == prefix
+                        and ids[-1] not in seen and ids[-1] not in special):
+                    labels.append(label)
+                    seen.add(ids[-1])
+            if len(labels) < self.max_choice_options:
+                raise ValueError(
+                    f"Tokenizer supports only {len(labels)} distinct two-letter Choice labels; "
+                    "reduce --max-choice-options (50 or fewer uses legacy labels)"
+                )
+            self._extended_choice_labels = tuple(labels)
+        return self._extended_choice_labels
 
     def compile(self, request: ClassifierRequest, *, render_only=False):
         """Validate text input and compile one branch per shared-plan question.
@@ -153,7 +197,14 @@ class PromptCompiler:
         ):
             raise ValueError("HF text reference accepts plain text chat only")
 
-        plan = prepare_prompt(request, version=self.version)
+        largest_choice = max((len(q.criteria) for q in request.questions.values()
+                              if q.type == 'choice'), default=0)
+        if largest_choice > self.max_choice_options:
+            raise ValueError(f"Choice has {largest_choice} options; maximum is {self.max_choice_options}")
+        labels = self.validate_choice_capacity() if largest_choice > 50 else ()
+        plan, binary_noul_keys = prepare_policy(
+            request, self.version, self.prompt_policy, extended_choice_labels=labels
+        )
         system = plan.system_prompt_prefix + plan.prefix_instruction
         branches = []
         for question in plan.questions:
@@ -179,20 +230,45 @@ class PromptCompiler:
                     messages.insert(0, {"role": "system", "content": system})
                 messages.append({"role": "user", "content": content})
 
+            messages, reasoning_content = format_branch(
+                messages, request, question.question_id, self.prompt_policy
+            )
             ids, output_ids = [], []
             if not render_only:
                 # Render first, then append incomplete JSON to the open assistant
                 # position. Do not create a completed assistant message or add
                 # a closing brace/EOS before the next-token scoring position.
-                text = (
-                    self.tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=False,
+                if self.prompt_policy == "baseline":
+                    text = (
+                        self.tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                        + question.answer_prefix
                     )
-                    + question.answer_prefix
-                )
+                else:
+                    # Supply a fixed assistant prefill via the native template;
+                    # this does not run a generation or reasoning stage.
+                    assistant = {"role": "assistant", "content": question.answer_prefix}
+                    if reasoning_content is not None:
+                        assistant["reasoning_content"] = reasoning_content
+                    # Match the native serving renderer's OpenAI text-block
+                    # representation. Templates may distinguish a string from
+                    # one text block (e.g. a system-turn boundary space). Do not
+                    # hardcode model names, whitespace, or tokenizer IDs here.
+                    native_messages = [
+                        {**message, "content": [{"type": "text", "text": message["content"]}]}
+                        for message in messages + [assistant]
+                    ]
+                    text = self.tokenizer.apply_chat_template(
+                        native_messages, tokenize=False,
+                        add_generation_prompt=False, continue_final_message=True,
+                        enable_thinking=reasoning_content is not None,
+                    )
+                    if reasoning_content is not None and reasoning_content not in text:
+                        raise ValueError("Model chat template did not preserve fixed policy reasoning content")
                 # The template already supplies special tokens. Adding another
                 # BOS/EOS during encode would alter the intended model input.
                 ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -220,9 +296,10 @@ class PromptCompiler:
                     output_ids,
                     messages,
                     question.answer_prefix,
+                    reasoning_content,
                 )
             )
-        return CompiledRequest(plan, branches)
+        return CompiledRequest(plan, branches, binary_noul_keys)
 
 
 # Inference result
@@ -688,19 +765,27 @@ class DecisionService:
         queue_size=16,
         max_request_branches=100,
         model_aliases=(),
+        enforce_model_id=False,
+        max_choice_options=255,
         advanced_metrics=None,
     ):
         """Configure admission and diagnostic output for a loaded model.
 
         concurrency counts active coroutine slots; queue_size adds waiting slots.
         Supply a positive concurrency and nonnegative queue size. model_aliases
-        permits additional names for the same loaded model, not dynamic loading.
+        permits additional names when enforce_model_id is enabled, not dynamic
+        loading. By default any request ID is accepted; responses identify model.
+        max_choice_options limits Choice cardinality independently of branch count.
         advanced_metrics explicitly overrides the environment flag when provided;
         otherwise 1/true/yes/on enable ENABLE_OPEN_JEV_ADVANCED_METRICS.
         """
         if max_request_branches < 1:
             raise ValueError("max_request_branches must be positive")
         self.max_request_branches = max_request_branches
+        if type(max_choice_options) is not int or not 2 <= max_choice_options <= 255:
+            raise ValueError("max_choice_options must be between 2 and 255")
+        self.max_choice_options = max_choice_options
+        self.enforce_model_id = enforce_model_id
         self.model_aliases = {model, *model_aliases}
         self.model = model
         self.compiler = compiler
@@ -726,8 +811,12 @@ class DecisionService:
         """
         if not isinstance(request, ClassifierRequest):
             request = ClassifierRequest.model_validate(request)
-        if request.model not in self.model_aliases:
-            raise ValueError(f"Loaded model is {self.model!r}")
+        if self.enforce_model_id and request.model not in self.model_aliases:
+            raise ValueError(f"Served model is {self.model!r}")
+        for question in request.questions.values():
+            if question.type == 'choice' and len(question.criteria) > self.max_choice_options:
+                raise ValueError(f"Choice options exceed configured maximum of {self.max_choice_options}")
+        request = request.model_copy(update={'model': self.model})
         # v1 has exactly one inference branch per question; candidate count no
         # longer expands requests. The shared schema separately caps 256 questions.
         branches = len(request.questions)
@@ -746,6 +835,7 @@ class DecisionService:
                 queued = time.perf_counter() - start
                 if hasattr(self.backend, "classify_native"):
                     response = await self.backend.classify_native(request)
+                    response['model'] = self.model
                     if self.advanced_metrics:
                         response["metadata"] = {
                             **self.metadata,
@@ -783,6 +873,7 @@ class DecisionService:
                     output_tokens=result.metrics.get("branch_output_tokens", 0),
                     advanced=self.advanced_metrics,
                 )
+                restore_binary_noul(response, compiled.binary_noul_keys)
                 # Common handles answer filtering and authoritative version data;
                 # the server only adds backend-specific metadata and timings.
                 if self.advanced_metrics:
@@ -889,6 +980,15 @@ def create_app(service):
     async def health():
         """Return the configured model identifier without invoking inference."""
         return {"status": "ready", "model": service.model}
+
+    @app.get("/v1/models")
+    async def models():
+        """Discovery is metadata-only and never occupies an inference slot."""
+        return {"object": "list", "data": [{
+            "id": service.model, "object": "model", "created": 0,
+            "owned_by": "simple-jev",
+            "x_max_choice_options": service.max_choice_options,
+        }]}
 
     attach_routes(app, lambda request: service)
     return app
@@ -1025,19 +1125,23 @@ class LlamaCppTokenizer:
     llama.cpp — its tokenizer reads the GGUF's embedded vocabulary, and the
     chat template is rendered from the GGUF's tokenizer.chat_template metadata
     with the same Jinja environment settings llama-cpp-python uses (matching
-    Transformers' trim_blocks/lstrip_blocks conventions).
+    Transformers' trim_blocks/lstrip_blocks conventions). Named prompt policies
+    additionally render with continue_final_message, reproduced here with
+    Transformers' own tag-and-truncate rule, and extended Choice labels
+    consult all_special_ids.
     """
 
-    def __init__(self, model, metadata=None):
+    def __init__(self, model, metadata=None, chat_template=None):
+        """Bind a loaded GGUF vocabulary; chat_template overrides the embedded one."""
         from llama_cpp.llama_chat_format import Jinja2ChatFormatter
 
         self._model = model
         metadata = metadata if metadata is not None else model.metadata()
-        template = metadata.get("tokenizer.chat_template")
+        template = chat_template or metadata.get("tokenizer.chat_template")
         if not template:
             raise ValueError(
                 "GGUF file has no tokenizer.chat_template metadata; the shared "
-                "v1 template requires a chat-formatted model"
+                "v1 template requires a chat-formatted model (or --chat-template-file)"
             )
         bos_text, eos_text = "", ""
         try:
@@ -1051,6 +1155,7 @@ class LlamaCppTokenizer:
         self._bos_text = bos_text
         self._eos_text = eos_text
         self._formatters = {}
+        self._special_ids = None
 
     def _formatter(self, add_generation_prompt):
         """Build (and cache) a Jinja formatter per generation-prompt setting.
@@ -1068,6 +1173,25 @@ class LlamaCppTokenizer:
                 add_generation_prompt=add_generation_prompt,
             )
         return self._formatters[add_generation_prompt]
+
+    @property
+    def all_special_ids(self):
+        """Control-token IDs, the GGUF counterpart of HF's special tokens.
+
+        Extended Choice labels must never map to one of these. Scanned once on
+        first use; ordinary requests with 50 or fewer options never need it.
+        """
+        if self._special_ids is None:
+            import llama_cpp
+
+            control = llama_cpp.LLAMA_TOKEN_ATTR_CONTROL
+            vocab = llama_cpp.llama_model_get_vocab(self._model.model)
+            self._special_ids = frozenset(
+                token
+                for token in range(llama_cpp.llama_vocab_n_tokens(vocab))
+                if llama_cpp.llama_vocab_get_attr(vocab, token) & control
+            )
+        return self._special_ids
 
     def encode(self, text, add_special_tokens=False):
         """Tokenize text with llama.cpp's native GGUF tokenizer.
@@ -1091,13 +1215,204 @@ class LlamaCppTokenizer:
         """
         if kwargs.get("tokenize"):
             raise ValueError("This adapter renders chat templates as text only")
+        add_generation_prompt = bool(kwargs.get("add_generation_prompt"))
+        continue_final = bool(kwargs.get("continue_final_message"))
+        if continue_final and add_generation_prompt:
+            raise ValueError(
+                "continue_final_message and add_generation_prompt are not compatible"
+            )
+        # continue_final_message is a renderer option, not a template variable.
         forward = {
             key: value
             for key, value in kwargs.items()
-            if key not in {"tokenize", "add_generation_prompt"}
+            if key not in {"tokenize", "add_generation_prompt", "continue_final_message"}
         }
-        formatter = self._formatter(bool(kwargs.get("add_generation_prompt")))
-        return formatter(messages=messages, **forward).prompt
+        formatter = self._formatter(add_generation_prompt)
+        if continue_final:
+            messages, final = mark_final_message(messages, self._template)
+        rendered = formatter(messages=messages, **forward).prompt
+        if continue_final:
+            rendered = cut_at_final_message(rendered, final)
+        return rendered
+
+
+# Transformers' sentinel for continue_final_message, reproduced verbatim.
+CONTINUE_FINAL_MESSAGE_TAG = "CONTINUE_FINAL_MESSAGE_TAG "
+
+
+def mark_final_message(messages, template):
+    """Copy messages, appending the continuation tag to the final text.
+
+    Mirrors Transformers 5.x render_jinja_template: the tag goes after the last
+    text block of the final message (or after string content) so the rendered
+    chat can be cut exactly where that message ends, before any end-of-turn
+    tokens the template would emit.
+    """
+    import copy
+
+    messages = copy.deepcopy(messages)
+    final = messages[-1].get("content")
+    if final is None:
+        raise ValueError('continue_final_message is set but the final message has no "content" to continue!')
+    if "content" not in template:
+        raise ValueError('continue_final_message is set to "content" but this is not an accepted field in the chat_template')
+    if isinstance(final, (list, tuple)):
+        for block in reversed(final):
+            if "text" in block:
+                final = block["text"]
+                block["text"] = block["text"] + CONTINUE_FINAL_MESSAGE_TAG
+                break
+        else:
+            raise ValueError(
+                "continue_final_message is set but we could not find any text to continue in the final message!"
+            )
+    else:
+        messages[-1]["content"] = final + CONTINUE_FINAL_MESSAGE_TAG
+    return messages, final
+
+
+def cut_at_final_message(rendered, final):
+    """Truncate a render at the continuation tag, as Transformers 5.x does."""
+    if final.strip() not in rendered or CONTINUE_FINAL_MESSAGE_TAG.strip() not in rendered:
+        raise ValueError(
+            "continue_final_message is set but the final message does not appear in the chat "
+            "after applying the chat template"
+        )
+    location = rendered.rindex(CONTINUE_FINAL_MESSAGE_TAG.strip())
+    if rendered[location : location + len(CONTINUE_FINAL_MESSAGE_TAG)] == CONTINUE_FINAL_MESSAGE_TAG:
+        return rendered[:location]
+    # The template trimmed trailing spacing after the tag.
+    return rendered[:location].rstrip()
+
+
+# GGUF header value types: scalar struct formats, 8 = string, 9 = array.
+_GGUF_SCALARS = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?",
+                 10: "Q", 11: "q", 12: "d"}
+
+
+def read_gguf_metadata(path):
+    """Read a GGUF file's key/value header without touching tensor data.
+
+    llama.cpp's own metadata view omits every array, yet some hyperparameters
+    (e.g. Gemma 4's per-layer KV head counts) are stored only as arrays. String
+    arrays (vocabulary, merges) are skipped; numeric arrays become lists.
+    """
+    import struct
+
+    with open(path, "rb") as handle:
+
+        def read(fmt):
+            fmt = "<" + fmt
+            return struct.unpack(fmt, handle.read(struct.calcsize(fmt)))[0]
+
+        def string():
+            return handle.read(read("Q")).decode("utf-8", errors="replace")
+
+        if handle.read(4) != b"GGUF" or read("I") not in (2, 3):
+            raise ValueError(f"{path} is not a little-endian GGUF v2/v3 file")
+        read("Q")  # tensor count
+        values = {}
+        for _ in range(read("Q")):
+            key, kind = string(), read("I")
+            if kind == 8:
+                values[key] = string()
+            elif kind == 9:
+                item, count = read("I"), read("Q")
+                if item == 8:
+                    for _ in range(count):
+                        handle.seek(read("Q"), 1)
+                    continue
+                if item not in _GGUF_SCALARS:
+                    raise ValueError(f"Unsupported GGUF array type in {key!r}")
+                fmt = "<%d%s" % (count, _GGUF_SCALARS[item])
+                values[key] = list(struct.unpack(fmt, handle.read(struct.calcsize(fmt))))
+            elif kind in _GGUF_SCALARS:
+                values[key] = read(_GGUF_SCALARS[kind])
+            else:
+                raise ValueError(f"Unsupported GGUF value type in {key!r}")
+        return values
+
+
+# GGUF stores llama.cpp architecture names, not HF model_type strings. These are
+# the text backbones named by hf_prompt_policies.KNOWN_PROFILES; one GGUF name may
+# cover several HF text configs, which are then told apart by size alone.
+GGUF_MODEL_TYPES = {
+    "qwen35": ("qwen3_5_text",),
+    "qwen35moe": ("qwen3_5_moe_text",),
+    "gemma4": ("gemma4_text", "gemma4_unified_text"),
+}
+
+
+def gguf_backbone_config(metadata, vocab_size):
+    """Translate GGUF hyperparameters into the HF text-config fingerprint fields.
+
+    The result feeds hf_prompt_policies.resolve_prompt_policy, so a GGUF file
+    receives the same architecture/size recommendation as its HF checkpoint,
+    independent of file, repository, or served names. Conversion conventions:
+    block_count includes appended MTP (nextn) layers; per-layer arrays describe
+    sliding-window layers where HF's head_dim/num_key_value_heads do (Gemma 4
+    stores the full-attention head size as key_length and the sliding one as
+    key_length_swa); absent or zero expert fields mean a dense model.
+    """
+    arch = str(metadata.get("general.architecture", ""))
+
+    def get(key):
+        return metadata.get(f"{arch}.{key}")
+
+    def first(value):
+        return value[0] if isinstance(value, list) and value else value
+
+    sliding = get("attention.sliding_window_pattern")
+    layer = sliding.index(True) if isinstance(sliding, list) and True in sliding else 0
+    kv_heads = get("attention.head_count_kv")
+    if isinstance(kv_heads, list):
+        kv_heads = kv_heads[layer] if layer < len(kv_heads) else first(kv_heads)
+    layers = get("block_count")
+    if layers is not None:
+        layers -= get("nextn_predict_layers") or 0
+    head_dim = get("attention.key_length_swa") or get("attention.key_length")
+    text = {
+        "hidden_size": get("embedding_length"),
+        "num_hidden_layers": layers,
+        "num_attention_heads": first(get("attention.head_count")),
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "intermediate_size": first(get("feed_forward_length")) or None,
+        "num_experts": get("expert_count") or None,
+        "moe_intermediate_size": get("expert_feed_forward_length") or None,
+        "num_experts_per_tok": get("expert_used_count") or None,
+        "vocab_size": vocab_size,
+    }
+    candidates = GGUF_MODEL_TYPES.get(arch, (f"gguf:{arch}",))
+    for model_type in candidates:
+        signature = tuple(
+            model_type if field == "model_type"
+            else text["num_experts_per_tok"] if field == "active_experts"
+            else text[field]
+            for field in PROFILE_FIELDS
+        )
+        if any(signature == expected for _, _, expected in KNOWN_PROFILES):
+            break
+    else:
+        model_type = candidates[0]
+    return {"model_type": model_type, "text_config": {"model_type": model_type, **text}}
+
+
+# One question of each type. Loading compiles it with the selected policy and
+# the GGUF's own template/tokenizer, so a template that cannot render the policy
+# (e.g. no reasoning_content support) or unstable answer labels fail at startup
+# rather than on every request.
+STARTUP_PROBE_REQUEST = {
+    "model": "startup-probe",
+    "state": "A small cat sleeps on a red sofa.",
+    "questions": {
+        "choice": {"type": "choice", "instructions": "Which animal?",
+                   "criteria": {"cat": "A cat", "dog": "A dog"}},
+        "score": {"type": "score", "instructions": "Is an animal present?",
+                  "criteria": ["absent", "present"]},
+        "noul": {"type": "noul", "instructions": "Is the sofa red?"},
+    },
+}
 
 
 def load_service(
@@ -1105,6 +1420,7 @@ def load_service(
     *,
     revision=None,
     gguf_file=None,
+    prompt_policy=None,
     backend="llama-cpp",
     subfolder=None,
     rope_factor=1,
@@ -1116,23 +1432,47 @@ def load_service(
     max_batch_tokens=32768,
     max_request_branches=100,
     prefix_sharing="auto",
+    chat_template_file=None,
+    served_model_name=None,
+    enforce_model_id=False,
+    max_choice_options=255,
 ):
     """Load a model and return a ready-to-use service, without starting HTTP.
 
-    device selects weight placement: cpu keeps everything on the host, auto
-    offloads every layer to any available llama.cpp backend (Vulkan included)
-    and falls back to CPU where no device exists. dtype selects the KV cache
-    element type. max_model_len limits each complete compiled prompt and sizes
-    the unified KV pool. max_batch_tokens limits packed suffix tokens per
-    decode, not the shared-prefix prefill or total KV memory.
-    max_request_branches caps questions admitted in a single request.
+    An omitted prompt_policy selects a known architecture/size recommendation
+    from the GGUF header; unknown profiles warn and fall back to baseline.
+    Explicit strings always win. device selects weight placement: cpu keeps
+    everything on the host, auto offloads every layer to any available
+    llama.cpp backend (Vulkan included) and falls back to CPU where no device
+    exists. dtype selects the KV cache element type. max_model_len limits each
+    complete compiled prompt and sizes the unified KV pool. max_batch_tokens
+    limits packed suffix tokens per decode, not the shared-prefix prefill or
+    total KV memory. max_request_branches caps questions admitted in a single
+    request; max_choice_options separately caps options per Choice question.
 
+    served_model_name is the public ID for discovery and responses (default:
+    model_name); with enforce_model_id, requests must name it.
+    chat_template_file replaces the GGUF's embedded tokenizer.chat_template,
+    e.g. when a file was converted with an outdated template.
+
+    The GGUF vocabulary, chat template, prompt policy, and Choice label capacity
+    are validated from a vocabulary-only load before any weights are loaded:
+    STARTUP_PROBE_REQUEST must compile under the selected policy.
     The loader sets service concurrency to one: separate requests are
     serialized, while branches within a request are batched. The backend's
     thread lock also prevents overlap if cancellation releases admission
     before a decode ends.
     """
     validate_rope_factor(rope_factor)
+    if prompt_policy is not None:
+        validate_policy(prompt_policy)
+    if type(max_choice_options) is not int or not 2 <= max_choice_options <= 255:
+        raise ValueError("max_choice_options must be between 2 and 255")
+    if served_model_name is not None and not served_model_name.strip():
+        raise ValueError("served_model_name must not be empty")
+    public_model = served_model_name if served_model_name is not None else model_name
+    if backend == "laya" and prompt_policy not in (None, "baseline"):
+        raise ValueError("Prompt policies apply only to --backend llama-cpp; Laya uses native formatting")
     if backend == "laya":
         # Resolve the revision ourselves because the SDK does not expose it.
         # Import only when selected; a llama.cpp installation stays usable.
@@ -1163,9 +1503,11 @@ def load_service(
         )
         extend_laya_rope(agent, rope_factor)
         return DecisionService(
-            model_name,
+            public_model,
             None,
             LayaBackend(agent, max_model_len),
+            enforce_model_id=enforce_model_id,
+            max_choice_options=max_choice_options,
             concurrency=1,
             max_request_branches=max_request_branches,
             metadata={
@@ -1182,14 +1524,52 @@ def load_service(
         raise ValueError("--subfolder is currently supported only with --backend laya")
     if dtype not in KV_CACHE_TYPES:
         raise ValueError(f"Unsupported dtype: {dtype}")
+    if prefix_sharing not in ("auto", "on", "off"):
+        raise ValueError(f"Unknown prefix sharing mode: {prefix_sharing}")
+    resolved_layers = resolve_n_gpu_layers(device, n_gpu_layers)
     # Heavy dependencies are local to loading, so CLI help and source inspection
     # do not initialize a backend or import the model classes.
     import llama_cpp
     from llama_cpp import _internals
 
+    chat_template = (
+        Path(chat_template_file).read_text(encoding="utf-8")
+        if chat_template_file
+        else None
+    )
     gguf_path = resolve_gguf_path(model_name, revision, gguf_file)
+    # A vocabulary-only load reads the tokenizer and chat template without any
+    # weights, so an unusable template, policy, or label capacity fails fast.
+    vocab_params = llama_cpp.llama_model_default_params()
+    vocab_params.vocab_only = True
+    vocab = _internals.LlamaModel(
+        path_model=gguf_path, params=vocab_params, verbose=False
+    )
+    try:
+        prompt_policy, policy_selection = resolve_prompt_policy(
+            gguf_backbone_config(read_gguf_metadata(gguf_path), vocab.n_vocab()),
+            prompt_policy,
+        )
+        probe = PromptCompiler(
+            LlamaCppTokenizer(vocab, chat_template=chat_template),
+            max_tokens=2**31,
+            prompt_policy=prompt_policy,
+            max_choice_options=max_choice_options,
+        )
+        probe.validate_choice_capacity()
+        try:
+            probe.compile(STARTUP_PROBE_REQUEST)
+        except Exception as exc:
+            raise ValueError(
+                f"This GGUF's chat template/tokenizer cannot serve prompt policy "
+                f"{prompt_policy!r} ({type(exc).__name__}: {exc}). Pass "
+                "--chat-template-file with a template that supports it, or choose "
+                "another --classifier-prompt-policy (baseline works with any "
+                "chat template)"
+            ) from exc
+    finally:
+        vocab.close()
     model_params = llama_cpp.llama_model_default_params()
-    resolved_layers = resolve_n_gpu_layers(device, n_gpu_layers)
     # llama.cpp encodes "all layers" as INT32 max; -1 is this API's spelling.
     model_params.n_gpu_layers = (
         0x7FFFFFFF if resolved_layers == -1 else resolved_layers
@@ -1206,9 +1586,6 @@ def load_service(
         llama_cpp.llama_model_is_recurrent(model.model)
         or llama_cpp.llama_model_is_hybrid(model.model)
     )
-    if prefix_sharing not in ("auto", "on", "off"):
-        model.close()
-        raise ValueError(f"Unknown prefix sharing mode: {prefix_sharing}")
     share_prefix = not stateful if prefix_sharing == "auto" else prefix_sharing == "on"
     n_ctx_train = model.n_ctx_train()
     if max_model_len > n_ctx_train:
@@ -1228,14 +1605,22 @@ def load_service(
     context_params.type_k = KV_CACHE_TYPES[dtype]
     context_params.type_v = KV_CACHE_TYPES[dtype]
     configure_rope(context_params, rope_factor)
-    context = _internals.LlamaContext(
-        model=model, params=context_params, verbose=False
-    )
+    try:
+        context = _internals.LlamaContext(
+            model=model, params=context_params, verbose=False
+        )
+    except BaseException:
+        model.close()
+        raise
     # PromptCompiler's default comes from common.DEFAULT_TEMPLATE_VERSION.
     # Keep one compiler/backend pair for the service's loaded model/context.
     compiler = PromptCompiler(
-        LlamaCppTokenizer(model), max_tokens=max_model_len
+        LlamaCppTokenizer(model, chat_template=chat_template),
+        max_tokens=max_model_len,
+        prompt_policy=prompt_policy,
+        max_choice_options=max_choice_options,
     )
+    compiler.validate_choice_capacity()
     backend = LlamaCppBackend(
         model,
         context,
@@ -1244,15 +1629,20 @@ def load_service(
         share_prefix=share_prefix,
     )
     return DecisionService(
-        model_name,
+        public_model,
         compiler,
         backend,
+        enforce_model_id=enforce_model_id,
+        max_choice_options=max_choice_options,
         concurrency=1,
         max_request_branches=max_request_branches,
         metadata={
             "backend": "llama-cpp",
+            "prompt_policy": prompt_policy,
+            "prompt_policy_selection": policy_selection,
             "model_revision": revision,
             "gguf_path": gguf_path,
+            "chat_template_source": chat_template_file or "gguf",
             "n_gpu_layers": resolved_layers,
             "kv_cache_dtype": dtype,
             "stateful_architecture": stateful,
@@ -1277,6 +1667,14 @@ def main():
     parser.add_argument(
         "--gguf-file",
         help="GGUF filename to download from a Hugging Face repository",
+    )
+    parser.add_argument("--served-model-name", help="Public model ID for discovery and responses (default: --model)")
+    parser.add_argument("--enforce-model-id", action="store_true", help="Reject request model IDs other than the served name")
+    parser.add_argument("--max-choice-options", type=int, default=255, help="Maximum Choice options, 2–255 (default: 255)")
+    parser.add_argument(
+        "--classifier-prompt-policy", dest="prompt_policy",
+        choices=PROMPT_POLICIES, default=None,
+        help="Explicit format override; omitted: match known architecture/size, otherwise warn and use baseline. Named policies require state",
     )
     parser.add_argument(
         "--backend", choices=["llama-cpp", "laya"], default="llama-cpp"
@@ -1313,6 +1711,10 @@ def main():
         default="auto",
         help="Share prefix KV cells across branches; auto disables it for "
              "recurrent/hybrid architectures",
+    )
+    parser.add_argument(
+        "--chat-template-file",
+        help="Jinja chat template replacing the GGUF's embedded tokenizer.chat_template",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

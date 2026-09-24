@@ -2,9 +2,10 @@
 
 Standalone classifier HTTP API using llama.cpp (GGUF) through
 `llama-cpp-python`, with Vulkan GPU acceleration. Classifier validation,
-prompt text, and response scoring come from the sibling `common/` folder. Keep
-both folders in the checkout. No Open-JEV or vLLM runtime is required. The
-package includes `common` when installed/built from this repo.
+prompt text, and response scoring come from the sibling `common/` folder, and
+the startup-selected prompt formats from `hf_prompt_policies.py`. Keep both
+folders in the checkout. No Open-JEV, vLLM, PyTorch, or Transformers runtime is
+required. The package includes `common` when installed/built from this repo.
 
 ## Install and run
 
@@ -35,8 +36,9 @@ python hf-server/hf_server.py --model /path/to/model.gguf --device cpu
 After installation, `python -m hf_server` accepts the same arguments.
 `--model` accepts a local `.gguf` file path, a directory containing exactly
 one `.gguf` file, or a Hugging Face repository id. Use `--gguf-file NAME.gguf`
-to select one weight file from a repository with multiple GGUF variants (the
-repository identifier remains the request-visible model name).
+to select one weight file from a repository with multiple GGUF variants.
+`--chat-template-file PATH` replaces the GGUF's embedded chat template (see
+[Chat templates](#chat-templates)).
 Choose a context limit supported by the model. CPU testing can use
 `--device cpu --dtype float32`.
 
@@ -58,8 +60,8 @@ See the [complete HTTP API reference](API_REFERENCE.md) for all request fields,
 options, response formats, errors, limits, metrics and server arguments.
 
 `POST /v1/classifier` and its alias `POST /v1/systemone` return non-streaming JSON.
-`GET /health` reports readiness. `/docs` provides the generated API schema.
-The request model must match the name/path passed to `--model`.
+`GET /health` reports readiness; `GET /v1/models` lists the served model and its configured Choice limit. `/docs` provides the generated API schema.
+Use `--served-model-name` to set the public name (default: `--model`). Request model strings are not checked by default, so SDK defaults such as `jev-latest` work without selecting a different checkpoint. Add `--enforce-model-id` to require the served name. Responses always identify the served model.
 
 ```json
 {
@@ -82,11 +84,19 @@ The request model must match the name/path passed to `--model`.
 ```
 
 Supply exactly one of `messages` or `state`. State accepts text or JSON.
-Chat uses the model's GGUF chat template (`tokenizer.chat_template` metadata).
-Choice and score support up to 50 entries. The server defaults to 100 scoring
-branches per request; `--max-request-branches` configures the limit. The shared
-v1 template uses exactly one branch per question. Legacy choice/score modes and
-score-format switches are no longer accepted.
+Chat uses the model's GGUF chat template (`tokenizer.chat_template` metadata,
+or `--chat-template-file`). Choice supports up to 255 options by default;
+`--max-choice-options` sets a cap from 2 to 255. Score still supports up to 50 levels.
+Choice questions with at most 50 options retain their exact existing format. Larger
+questions use exclusively two-letter uppercase labels, validated as distinct single
+tokens, without mixing in single-letter labels. The GGUF loader checks that
+capacity against the file's vocabulary (excluding control tokens) from a
+vocabulary-only load, before any weights are loaded, and validates actual prompt
+boundaries on each request. Unsupported vocabularies can use
+`--max-choice-options 50`; options are never truncated. The server defaults to 100
+scoring branches per request; `--max-request-branches` configures the limit. The
+shared v1 template uses exactly one branch per question. Legacy choice/score
+modes and score-format switches are no longer accepted.
 Invalid input returns readable 422 errors; a full queue returns 429.
 
 Responses contain `model`, `answers`, and `usage`. Answers include confidence.
@@ -95,6 +105,154 @@ context once per question. `usage.output_tokens` is zero: this implementation
 reads logits without sampling any output tokens. Set
 `ENABLE_OPEN_JEV_ADVANCED_METRICS=1` to include detailed timing and metadata.
 Standard completion settings such as `max_tokens` and `temperature` are ignored.
+
+## Configure request limits
+
+Set these at server startup; they are independent:
+
+| Flag | Default | Controls |
+|---|---|---|
+| `--max-request-branches` | `100` | Maximum questions per HTTP request (one branch per question). Set `256` for the schema maximum; larger values do not permit more than 256 questions. |
+| `--max-model-len` | `16384` | Maximum tokens in each complete rendered branch: state/history, system and question instructions, options, template overhead, and repetitions. Not characters or output length. |
+| `--max-choice-options` | `255` | Maximum options in each Choice question; valid settings 2–255. Score stays at 50 levels; Noul is unchanged. |
+
+```bash
+simple-jev --model /models/Qwen3.8-27B-Q4_K_M.gguf --device auto --dtype bfloat16 \
+  --max-request-branches 256 --max-model-len 32768 --max-choice-options 255
+```
+
+This Qwen configuration automatically selects `examples_binary` when no prompt
+format is specified. Three 255-choice questions consume three branches, not 765.
+The limits do not guarantee that all maxima fit simultaneously: long options and
+policy repetition increase input length. Violations return 422; candidates/context
+are never silently truncated. Setting a larger token cap does not extend the
+checkpoint's native context support or guarantee sufficient memory:
+`--max-model-len` sizes the llama.cpp KV pool and is clamped to the GGUF's
+trained context length. The checked
+255-choice prompts fit at 32K; other content may require more.
+
+`--max-batch-size` and `--max-batch-tokens` control execution batches, not the
+question-count limit. A single suffix must also fit the batch-token budget;
+when using longer inputs, check that budget as well. Request `max_tokens` is not
+an input-length setting and is ignored for this non-generating classifier.
+See [the API limits reference](API_REFERENCE.md#limits-batching-and-cancellation).
+
+## Prompt format selection
+
+Omitting `--classifier-prompt-policy` auto-selects a development recommendation
+for known language-backbone architecture/size profiles. Matching uses the GGUF
+header (attention/expert dimensions and vocabulary), not file, repository, or
+served names. Unknown profiles fall back to `baseline` with a prominent warning
+to run `eval/prompt_search.py` first. Laya retains its native format.
+
+GGUF files do not carry Hugging Face's `config.json`, so the server reads the
+header's key/value metadata (`read_gguf_metadata`, including the per-layer arrays
+that llama.cpp's own metadata view omits) and translates it into the same
+fingerprint fields upstream reads from the HF text config
+(`gguf_backbone_config`):
+
+| Fingerprint field | GGUF key (`<arch>.` prefix) |
+|---|---|
+| `model_type` | `general.architecture`: `qwen35` → `qwen3_5_text`, `qwen35moe` → `qwen3_5_moe_text`, `gemma4` → `gemma4_text` or `gemma4_unified_text` (told apart by size) |
+| `hidden_size`, `num_hidden_layers` | `embedding_length`, `block_count` minus `nextn_predict_layers` (MTP) |
+| `num_attention_heads`, `num_key_value_heads` | `attention.head_count`, `attention.head_count_kv` (first sliding-window layer when per-layer) |
+| `head_dim` | `attention.key_length_swa` when present (Gemma 4), else `attention.key_length` |
+| `intermediate_size` | `feed_forward_length` |
+| `num_experts`, `moe_intermediate_size`, `num_experts_per_tok` | `expert_count`, `expert_feed_forward_length`, `expert_used_count` |
+| `vocab_size` | the GGUF vocabulary size |
+
+The mapping follows llama.cpp's `convert_hf_to_gguf.py`; the header of llama.cpp's
+Gemma 4 26B-A4B vocabulary GGUF resolves to the `Gemma MoE 26B-A4B` profile.
+Quantization type is not part of the fingerprint. Any other architecture is
+reported as `gguf:<arch>` in the warning and uses `baseline`.
+
+Explicit selection always overrides auto-selection. In particular, explicit
+`baseline` preserves the former default prompts, scoring, and text-chat support:
+
+```bash
+simple-jev --model /models/Qwen3.8-27B-Q4_K_M.gguf --device auto \
+  --classifier-prompt-policy examples_binary
+```
+
+| Reference model (any GGUF conversion of it) | Policy |
+|---|---|
+| Qwen/Qwen3.8-27B | `examples_binary` |
+| Qwen/Qwen3.6-35B-A3B | `repeat_state` |
+| Qwen/Qwen3.5-4B | `strict_mix_repeat2` |
+| google/gemma-4-26B-A4B-it | `strict_mix_repeat2` |
+| google/gemma-4-12B-it | `strict_mix_repeat2` |
+
+- `examples_binary`: strict decision rules, worked examples, raw text/pretty
+  JSON state once, and binary no/yes Noul scoring.
+- `repeat_state`: the same format with an explicitly marked second state copy.
+- `strict_mix_repeat2`: strict rules, the entire user block twice, and the
+  evaluated nine-bin Noul wording/scoring. No extra worked-example block.
+
+The three named policies accept **text/JSON `state` only**, not `messages`;
+use `baseline` to preserve text chat turns. The server still rejects images/tools.
+Choice branches prefill three fixed `[thinking]` lines through the model's native
+chat template; Score/Noul branches answer directly. This does not generate
+reasoning or output tokens. A template that drops the fixed prefill is rejected.
+Binary Noul returns `{"type":"noul","noul":P(yes)}` in [0,1], with no nine-bin
+0.01–0.99 remapping or nested rating diagnostics. Choice/Score math is unchanged.
+
+These formats were selected in development-set prompt experiments, not held-out
+evaluation. They are recommendations, not guaranteed optima for new revisions,
+fine-tunes, quantizations, or precision settings. Unregistered sizes are not
+guessed from nearby models. Advanced metadata records the resolved policy and
+selection mode/profile (`prompt_policy`, `prompt_policy_selection`).
+
+For a new model, use the [quick prompt search](../eval/README.md#prompt-format-search):
+
+```bash
+python eval/prompt_search.py --model /models/YOUR_MODEL.gguf --device auto \
+  --max-model-len 32768 --output eval/results/my-prompt-search
+```
+
+Run this from the repository root in the server environment after preparing the
+quick datasets. It evaluates all four formats sequentially with native scoring;
+apply the winner explicitly. Repeated-input policies need enough context (32K
+fits the checked 255-option case), and larger requests use more memory.
+
+Named policies pass text blocks to the model's native template while
+leaving baseline rendering unchanged. The fixed assistant prefill is rendered with
+`add_generation_prompt=False` and `continue_final_message=True`; llama-cpp-python's
+Jinja formatter has no such option, so `LlamaCppTokenizer` reproduces Transformers
+5.x exactly (a sentinel appended to the final message's last text block, then the
+render is cut there, dropping the template's end-of-turn tokens). Prompt selection
+does not establish numerical equivalence across execution environments or a
+throughput guarantee.
+Repetition consumes additional context; the complete rendered branch remains
+subject to `--max-model-len`. Advanced metadata identifies
+`hf-<policy>-v1` instead of the baseline `v1` template.
+
+This is a prompt/scoring-adapter addition only: the llama.cpp context, KV cache
+reuse, batching, locking, admission and inference code are unchanged. Loading
+gains the header fingerprint, a vocabulary-only probe, and the startup compile
+check below. No worker, stream, kernel, or other performance optimizations are
+included. Laya keeps its native formatting and rejects non-baseline prompt
+policies at startup. Implementation: `hf_prompt_policies.py` (upstream's module,
+unmodified), packaged alongside `hf_server.py`.
+
+### Chat templates
+
+Every format renders through the GGUF chat template. Before loading weights, the
+server compiles a one-question-per-type sample request with the selected format,
+so a template or vocabulary that cannot serve it stops startup with an explicit
+message instead of failing every request. Typical causes:
+
+- The named formats need a template that accepts OpenAI-style text-block
+  `content` lists and renders assistant `reasoning_content` when
+  `enable_thinking` is set. Qwen3.5's template does. Older templates (for
+  example Qwen2.5's, or Gemma 4 templates that render reasoning only next to tool
+  calls) do not, and are rejected just as upstream's Transformers server rejects
+  a template that drops the fixed prefill.
+- Answer labels must be single distinct tokens after the rendered answer prefix.
+
+GGUF conversions often embed the template current at conversion time. Pass
+`--chat-template-file newer.jinja` to use another one; it applies to every request,
+and advanced metadata reports `chat_template_source`. Otherwise choose another
+`--classifier-prompt-policy`; `baseline` works with any chat template.
 
 ## Shared-prefix execution
 
@@ -152,6 +310,24 @@ implementation is **not** guaranteed on GPU. Use `--device cpu --dtype
 float32` when scoring must be numerically anchored; treat GPU results as
 approximately equal, not identical.
 
+With a GPU-enabled wheel (for example Vulkan), `--device cpu` keeps the weights
+on the host but llama.cpp still *offloads operations* for batches of 32 or more
+tokens to the GPU (`op_offload`, on by default): the startup log shows a
+non-zero `Vulkan0 compute buffer`. The server keeps llama.cpp's default, so
+results stay comparable with earlier runs on the same machine; for a strictly
+CPU reference use a CPU-only `llama-cpp-python` build. The real-engine fidelity
+test disables op offload itself when `SIMPLE_JEV_DEVICE=cpu`.
+
+Recurrent and hybrid models (e.g. `qwen35`) have one more batch effect, on CPU
+too: llama.cpp slices packed sequences into equal-length sub-batches, so a
+question row packed with longer rows has its recurrent state computed in several
+pieces instead of one pass. Its scores then differ slightly from scoring that
+prompt alone (about 0.03 logits on Qwen3.5-0.8B-BF16), with either
+`--prefix-sharing` mode. Scores are still deterministic for the same request
+and settings; rows of equal length are unaffected. On Windows consoles, set
+`PYTHONUTF8=1` to avoid harmless `UnicodeEncodeError` warnings from
+llama-cpp-python's log callback.
+
 ## Scope and validation
 
 This reference currently accepts **text only**, including text messages.
@@ -163,14 +339,19 @@ per-branch prefill, described in
 [Recurrent and hybrid architectures](#recurrent-and-hybrid-architectures).
 Arbitrary model compatibility is not guaranteed.
 
-The shared v1 prompt and scoring rules are the source of truth for this server.
+The shared v1 prompt and scoring rules are the source of truth for the explicit
+`baseline` format; alternative policy differences are described above.
 It does not claim exact numeric equivalence with another inference engine.
 Tests verify the orchestration against a stubbed engine — prefix reuse, per-row
-sequence copies, packed batches, cleanup, metrics, cancellation — and, when
-`SIMPLE_JEV_GGUF` points at a local GGUF file, compare shared-prefix scores
-against independent full-prompt decodes on the real engine plus an end-to-end
-HTTP check. `SIMPLE_JEV_DEVICE` (default `cpu`) pins the device for those runs.
-They establish execution equivalence, not answer quality.
+sequence copies, packed batches, cleanup, metrics, cancellation — plus the
+loader (GGUF header fingerprinting, vocabulary-only probe, served names, Choice
+capacity, prompt formats, template override) against a stubbed llama.cpp loader,
+and `continue_final_message` rendering (compared with Transformers when it is
+installed). When `SIMPLE_JEV_GGUF` points at a local GGUF file, they also compare
+shared-prefix scores against independent full-prompt decodes on the real engine
+and run end-to-end HTTP checks, including discovery and a 64-option Choice.
+`SIMPLE_JEV_DEVICE` (default `cpu`) pins the device for those runs. They
+establish execution equivalence, not answer quality.
 
 ```bash
 python -m pytest -c hf-server/pyproject.toml common/tests hf-server/tests -q
@@ -212,7 +393,8 @@ output tokens are zero. Advanced metadata identifies the format as `laya-native`
 The shared admission queue and a model lock bound concurrent work; cancellation
 cannot interrupt an already running engine forward.
 
-Validation on macOS (2026-09-20): 50 common/server tests passed, including tiny
+Upstream validation of the Transformers server on macOS (2026-09-20), retained
+for the Laya results: 50 common/server tests passed, including tiny
 Qwen/Gemma backend regression tests and Laya adapter validation. Real weights for
 `convaiinnovations/laya` and `Qwen/Qwen3.5-0.8B` both returned HTTP 200 through the
 ASGI classifier route on CPU for a combined choice/score/Noul request, and rejected

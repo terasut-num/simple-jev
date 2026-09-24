@@ -164,7 +164,7 @@ python RFDT/train.py \
 
 Every training run also evaluates its final model and writes `eval_results.json`. Metrics are soft cross-entropy (`eval_loss`), target-mode agreement, mean target-to-student KL, and mean distribution L1 distance. Mode agreement against soft teacher targets is not ground-truth accuracy. Score/Noul scalar MAE and calibration metrics are not yet included. Keep an independently labeled test set for final task-quality claims.
 
-Full-weight output is already loadable by the HF server. Merge a LoRA adapter first (this export loads the base model in CPU memory):
+Training and export produce Hugging Face checkpoints (RFDT itself still uses Transformers and PyTorch). This fork's server loads GGUF, so convert full-weight output with llama.cpp's converter before serving it. Merge a LoRA adapter first (this export loads the base model in CPU memory):
 
 ```bash
 python RFDT/export.py \
@@ -172,11 +172,21 @@ python RFDT/export.py \
   --adapter RFDT/runs/student-lora \
   --output RFDT/runs/student-merged
 
+# From a llama.cpp checkout (pip install -r requirements.txt there first).
+python /path/to/llama.cpp/convert_hf_to_gguf.py RFDT/runs/student-merged \
+  --outtype f16 --outfile RFDT/runs/student-merged.gguf
+
 python hf-server/hf_server.py \
-  --model RFDT/runs/student-merged --device auto --dtype bfloat16
+  --model RFDT/runs/student-merged.gguf --device auto --dtype bfloat16 \
+  --classifier-prompt-policy baseline
 ```
 
-Use the exact training base model and revision when merging. `--revision` is available on training and export. Send the exported model path as the inference request's `model`. For evaluation of full-weight output, pass that output directory to `train.py --model ... --eval-only`.
+RFDT uses the shared baseline formatter. Pin `--classifier-prompt-policy baseline`
+when serving these exports so architecture-based startup recommendations do not
+replace the training prompt format (a fine-tune keeps its base model's GGUF
+fingerprint). Retune deliberately before choosing another format.
+
+Use the exact training base model and revision when merging. `--revision` is available on training and export. Requests may send any `model` string unless the server runs with `--enforce-model-id`. For evaluation of full-weight output, pass that output directory to `train.py --model ... --eval-only`.
 
 ## Tests
 

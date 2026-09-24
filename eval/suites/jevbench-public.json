@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "language_group": "english",
+  "languages": ["en"],
+  "category": "general-language",
+  "subcategory": "classification-decision",
+  "modality": "text",
+  "task_detail": "mixed-public-decisions",
+  "project": "JevBench public accuracy",
+  "project_configuration": "public-231",
+  "expected_rows": 231,
+  "id": "jevbench-public",
+  "version": "1",
+  "adapter": "jevbench-accuracy-v1",
+  "dataset": "../data/jevbench-public.jsonl",
+  "headline_metric": "accuracy",
+  "source": {
+    "url": "https://github.com/fstandhartinger/jevbench",
+    "revision": "83831807458d7df424a1e53e5724f3a3ffe2cf89",
+    "public_only": true,
+    "rows": 231
+  }
+}

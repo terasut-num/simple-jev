@@ -23,7 +23,7 @@ test = ["pytest", "pytest-asyncio", "httpx"]
 # Include the shared modules in the wheel without introducing a separate
 # common distribution. Build/install from a checkout containing both folders.
 [tool.setuptools]
-py-modules = ["hf_server"]
+py-modules = ["hf_server", "hf_prompt_policies"]
 packages = ["common"]
 package-dir = {"" = ".", common = "../common"}
 

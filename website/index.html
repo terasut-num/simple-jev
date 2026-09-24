@@ -39,6 +39,7 @@
       <nav aria-label="Main navigation">
         <a class="demos-nav" href="demos.html">Cool demos</a>
         <a href="playground.html" class="playground-nav">Playground</a>
+        <a class="eval-nav" href="evaluations.html">Evaluations</a>
         <a class="docs-link" href="docs.html">API docs</a>
         <a href="how-it-works.html">How it works</a>
         <a href="#rfdt">RFDT</a>
@@ -86,7 +87,7 @@
       <section class="quick-api wrap" aria-labelledby="quick-api-title">
         <div class="quick-api-heading">
           <h2 id="quick-api-title">Try the demo API in one request</h2>
-          <span>No login. No API key. (Limited to 2k context, and 4 RPS)</span>
+          <span>No login. No API key. (Limited to 2k context, and 2 RPS)</span>
         </div>
         <div class="quick-api-grid">
           <div class="docs-code">
@@ -100,7 +101,7 @@
             ><code>curl https://simple-jev-demo-api.featherless.ai/v1/classifier \
   -H &#x27;Content-Type: application/json&#x27; \
   -d &#x27;{
-    &quot;model&quot;: &quot;featherless-ai/gemma-4-26B-A4B-classifier&quot;,
+    &quot;model&quot;: &quot;featherless-ai/Qwen3.6-35B-A3B-classifier&quot;,
     &quot;state&quot;: &quot;Mia owns a red bicycle.&quot;,
     &quot;questions&quot;: {
       &quot;color&quot;: {
@@ -134,7 +135,7 @@
         </div>
         <p class="quick-api-note">
           Actual Gemma response, showing the <code>answers</code> field. Results
-          may vary. Demo limits: 2k tokens · 4 requests/second.
+          may vary. Demo limits: 2k tokens · 2 requests/second.
           <a href="docs.html">Full API documentation ↗</a>
         </p>
         <span class="sr-only" id="docs-copy-status" role="status"></span>

@@ -311,9 +311,30 @@ def build_real_service(gguf, **kwargs):
     return load_service(gguf, device=DEVICE, dtype="float32", **kwargs)
 
 
+# Uneven suffixes exercise padding-free packing of rows with different lengths.
+UNEVEN_SUFFIXES = [[100, 101], [102, 103, 104], [105]]
+EVEN_SUFFIXES = [[100, 101], [102, 103], [105, 106]]
+# Recurrent/hybrid memory slices packed sequences into equal-length sub-batches,
+# so a row packed with longer rows has its recurrence computed in several pieces
+# instead of one pass. That is float rounding, not a scoring error: measured
+# 0.026-0.029 logits on Qwen3.5-0.8B-BF16 (CPU), while a misrouted logits row
+# differs by ~10. Equal-length rows are not sliced and must match strictly.
+STATEFUL_UNEVEN_TOLERANCE = 0.1
+
+
 @real_engine
-async def test_shared_prefix_scores_match_independent_decodes():
-    """Backend scores equal independent full-prompt decodes on the same context."""
+@pytest.mark.parametrize("share_prefix", [True, False], ids=["shared_prefix", "per_branch"])
+async def test_shared_prefix_scores_match_independent_decodes(share_prefix):
+    """Backend scores equal independent full-prompt decodes on the same context.
+
+    Both prefill strategies the server can select (--prefix-sharing) are
+    checked. With SIMPLE_JEV_DEVICE=cpu the context also disables op offload, so
+    a GPU-enabled wheel (e.g. Vulkan) cannot move large batches to the GPU and
+    CPU remains the numerical reference. Attention-only models must match within
+    1e-3 even for uneven packed rows. Recurrent/hybrid models must match within
+    1e-3 for equal-length rows and within STATEFUL_UNEVEN_TOLERANCE for uneven
+    ones (see above). On other devices, the documented GPU tolerance applies.
+    """
     import llama_cpp
 
     llama_cpp.llama_backend_init()
@@ -325,36 +346,22 @@ async def test_shared_prefix_scores_match_independent_decodes():
     context_params.n_batch = 512
     context_params.n_seq_max = 4
     context_params.kv_unified = True
+    if DEVICE == "cpu":
+        context_params.op_offload = False
     context = _internals.LlamaContext(
         model=model, params=context_params, verbose=False
+    )
+    stateful = bool(
+        llama_cpp.llama_model_is_recurrent(model.model)
+        or llama_cpp.llama_model_is_hybrid(model.model)
     )
     try:
         toks = model.tokenize(
             b"Answer with one word only.", add_bos=True, special=False
         )
         prefix = list(toks[:10])
-        suffixes = [[100, 101], [102, 103, 104], [105]]
         # Noul questions score nine labels; give every label its own id.
         output_ids = [10 + i for i in range(9)]
-
-        # Independent references: one fresh sequence per full prompt, one clear.
-        reference = []
-        for suffix in suffixes:
-            llama_cpp.llama_memory_clear(context.memory, True)
-            full = prefix + suffix
-            batch = llama_cpp.llama_batch_init(len(full), 0, 1)
-            batch.n_tokens = len(full)
-            for j, token_id in enumerate(full):
-                batch.token[j] = token_id
-                batch.pos[j] = j
-                batch.seq_id[j][0] = 0
-                batch.n_seq_id[j] = 1
-                batch.logits[j] = j == len(full) - 1
-            assert llama_cpp.llama_decode(context.ctx, batch) == 0
-            logits = llama_cpp.llama_get_logits_ith(context.ctx, len(full) - 1)
-            reference.append([float(logits[i]) for i in output_ids])
-            llama_cpp.llama_batch_free(batch)
-
         plan = prepare_prompt(
             {
                 "model": "m",
@@ -365,25 +372,61 @@ async def test_shared_prefix_scores_match_independent_decodes():
                 },
             }
         )
-        branches = [
-            Branch(plan.questions[i].branch_id, prefix + suffixes[i], output_ids,
-                   [], "")
-            for i in range(3)
-        ]
-        result = await LlamaCppBackend(model, context).score(
-            CompiledRequest(plan, branches)
-        )
-        worst = 0.0
-        for i, question in enumerate(plan.questions):
-            assert set(result.logits[question.branch_id]) == set(
-                question.output_labels
-            ), result.logits
-            got = [
-                result.logits[question.branch_id][label]
-                for label in question.output_labels
+
+        async def worst_difference(suffixes):
+            # Independent references: one fresh sequence per full prompt.
+            reference = []
+            for suffix in suffixes:
+                llama_cpp.llama_memory_clear(context.memory, True)
+                full = prefix + suffix
+                batch = llama_cpp.llama_batch_init(len(full), 0, 1)
+                batch.n_tokens = len(full)
+                for j, token_id in enumerate(full):
+                    batch.token[j] = token_id
+                    batch.pos[j] = j
+                    batch.seq_id[j][0] = 0
+                    batch.n_seq_id[j] = 1
+                    batch.logits[j] = j == len(full) - 1
+                assert llama_cpp.llama_decode(context.ctx, batch) == 0
+                logits = llama_cpp.llama_get_logits_ith(context.ctx, len(full) - 1)
+                reference.append([float(logits[i]) for i in output_ids])
+                llama_cpp.llama_batch_free(batch)
+
+            branches = [
+                Branch(plan.questions[i].branch_id, prefix + suffixes[i], output_ids,
+                       [], "")
+                for i in range(3)
             ]
-            worst = max(worst, max(abs(a - b) for a, b in zip(got, reference[i])))
-        assert worst < 1e-3, f"shared-prefix scores diverged by {worst}"
+            result = await LlamaCppBackend(model, context, share_prefix=share_prefix).score(
+                CompiledRequest(plan, branches)
+            )
+            assert result.metrics["prefill_strategy"] == (
+                "shared_prefix" if share_prefix else "per_branch"
+            )
+            worst = 0.0
+            for i, question in enumerate(plan.questions):
+                assert set(result.logits[question.branch_id]) == set(
+                    question.output_labels
+                ), result.logits
+                got = [
+                    result.logits[question.branch_id][label]
+                    for label in question.output_labels
+                ]
+                worst = max(worst, max(abs(a - b) for a, b in zip(got, reference[i])))
+            return worst
+
+        # CPU is the numerical reference; GPU kernels deviate by up to ~0.1.
+        strict = 1e-3 if DEVICE == "cpu" else 0.15
+        strategy = "shared_prefix" if share_prefix else "per_branch"
+        if stateful:
+            worst = await worst_difference(EVEN_SUFFIXES)
+            assert worst < strict, f"{strategy} equal-length scores diverged by {worst}"
+            worst = await worst_difference(UNEVEN_SUFFIXES)
+            limit = max(strict, STATEFUL_UNEVEN_TOLERANCE)
+            assert worst < limit, f"{strategy} uneven scores diverged by {worst}"
+        else:
+            worst = await worst_difference(UNEVEN_SUFFIXES)
+            assert worst < strict, f"{strategy} scores diverged by {worst}"
     finally:
         context.close()
         model.close()
@@ -427,3 +470,41 @@ async def test_gguf_service_end_to_end_http():
             assert "confidence" in body["answers"]["color"]
     service.backend.context.close()
     service.backend.model.close()
+
+@real_engine
+async def test_gguf_discovery_served_name_and_extended_choice_http():
+    """Discovery, served names, and >50-option Choice through the real tokenizer."""
+    import httpx
+
+    from hf_server import create_app
+
+    service = build_real_service(
+        GGUF, max_model_len=8192, served_model_name="public-gguf", prompt_policy="baseline"
+    )
+    options = {f"item-{i}": None for i in range(64)}
+    payload = {
+        "model": "any-name",
+        "state": "The requested item is item-7.",
+        "questions": {
+            "item": {"type": "choice", "instructions": "Which item?", "criteria": options},
+            "small": {"type": "choice", "instructions": "Pick one.",
+                      "criteria": {"a": None, "b": None}},
+        },
+    }
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(service)), base_url="http://t"
+        ) as client:
+            models = (await client.get("/v1/models")).json()["data"]
+            assert [(m["id"], m["x_max_choice_options"]) for m in models] == [("public-gguf", 255)]
+            response = await client.post("/v1/classifier", json=payload)
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["model"] == "public-gguf"
+            probabilities = body["answers"]["item"]["probabilities"]
+            assert list(probabilities) == list(options)
+            assert sum(probabilities.values()) == pytest.approx(1, abs=1e-6)
+            assert len(body["answers"]["small"]["probabilities"]) == 2
+    finally:
+        service.backend.context.close()
+        service.backend.model.close()

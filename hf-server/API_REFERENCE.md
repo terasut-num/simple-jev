@@ -1,7 +1,8 @@
 # Simple-JEV HTTP API reference
 
-This reference describes the standalone llama.cpp implementation in
-`hf_server.py`, version 0.1.0. It does not require vLLM. The API evaluates many
+This reference describes the standalone llama.cpp (GGUF) implementation in
+`hf_server.py`, version 0.1.0. It does not require vLLM, PyTorch, or Transformers.
+The API evaluates many
 questions against one context and returns JSON in one non-streaming response.
 It reads selected next-token logits; it does not generate prose answers.
 
@@ -11,7 +12,8 @@ It reads selected next-token logits; it does not generate prose answers.
 | --- | --- | --- |
 | POST | `/v1/classifier` | Score the supplied questions. |
 | POST | `/v1/systemone` | Exact alias of `/v1/classifier`; omitted from generated OpenAPI. |
-| GET | `/health` | Returns `{"status":"ready","model":"<loaded model>"}` after service initialization. This does not run an inference probe. |
+| GET | `/v1/models` | OpenAI-style `object: "list"` with the served model ID and `x_max_choice_options`. No inference. |
+| GET | `/health` | Returns `{"status":"ready","model":"<served model>"}` after service initialization. This does not run an inference probe. |
 | GET | `/docs` | Interactive Swagger documentation. |
 | GET | `/redoc` | Generated ReDoc documentation. |
 | GET | `/openapi.json` | Generated request schema and route definitions. |
@@ -33,7 +35,9 @@ template and single-token answer labels:
 simple-jev --model Qwen/Qwen2.5-0.5B-Instruct-GGUF --host 0.0.0.0 --port 8000
 ```
 
-Use that same model identifier in requests:
+Request model IDs are accepted without name checking by default; they never select or load a model. `--served-model-name` controls the ID in discovery, health and responses (default: `--model`). Add `--enforce-model-id` to require that served ID. For example, `--served-model-name jev-latest --enforce-model-id` enables strict SDK-name matching.
+
+Example request:
 
 ```bash
 curl --fail-with-body http://localhost:8000/v1/classifier \
@@ -95,12 +99,12 @@ coercion.
 
 | Field | Type | Required/default | Behavior |
 | --- | --- | --- | --- |
-| `model` | string | Required; nonempty | Must match the model ID or local path used to start this server. The HTTP request does not load or switch models. |
+| `model` | string | Required; nonempty | Any nonempty ID is accepted by default. With `--enforce-model-id`, it must match the served name. The HTTP request does not load or switch models. |
 | `state` | string, object, array, or null | Supply exactly one non-null `state` or `messages` | Shared context. Objects/arrays are serialized into prompt text; they are not executable state. A top-level number or boolean is not supported. |
 | `messages` | array of messages or null | Alternative to `state`; at least one message | Text chat history rendered with the model's chat template. |
 | `questions` | object mapping IDs to questions | Required; 1–256 entries at schema level | IDs must be nonempty strings. The server's branch limit is additionally enforced, default 100. |
 | `options` | object | Defaults shown below | Response diagnostics; prompt/scoring rules are fixed by v1. |
-| `tools` | array of objects or null | Omitted/null | Reserved in the schema; nonempty values are rejected by the HF implementation. |
+| `tools` | array of objects or null | Omitted/null | Reserved in the schema; nonempty values are rejected by this implementation. |
 | `mm_processor_kwargs` | object or null | Omitted/null | Reserved; nonempty values are rejected. |
 | `media_io_kwargs` | object of objects or null | Omitted/null | Reserved; nonempty values are rejected. |
 
@@ -111,7 +115,7 @@ neither, returns 422.
 
 ### Chat messages
 
-For this HF implementation each message contains only:
+For this implementation each message contains only:
 
 | Field | Supported value |
 | --- | --- |
@@ -119,7 +123,7 @@ For this HF implementation each message contains only:
 | `content` | String, including an empty string |
 
 The shared schema also describes `tool`/`function` roles, null content, content
-part arrays and extra message fields. **The HF compiler rejects these.** Images,
+part arrays and extra message fields. **The GGUF compiler rejects these.** Images,
 audio, video, tool calls, `name`, and other extra message properties are not
 supported. A model's chat template may further restrict roles or their order.
 
@@ -144,7 +148,7 @@ entries. `instructions` is required even though its value may be null.
 
 | Question type | `instructions` | `criteria` |
 | --- | --- | --- |
-| `choice` | Required entry describing the question | Required object with 2–50 candidate IDs mapped to entries describing each candidate. Null descriptions are allowed. |
+| `choice` | Required entry describing the question | Required object with 2–255 candidate IDs, subject to `--max-choice-options`, mapped to entries describing each candidate. Null descriptions are allowed. |
 | `score` | Required entry describing what to evaluate | Required ordered array of 2–50 entries, lowest level first. |
 | `noul` | Required entry describing a truth/yes-no proposition | Optional object with only `"true"` and/or `"false"` keys mapped to entries; default null. Neither key is required. |
 
@@ -189,7 +193,7 @@ Every successful response contains:
 
 | Field | Meaning |
 | --- | --- |
-| `model` | Request model identifier. |
+| `model` | Configured served model identifier, regardless of the request's model string. |
 | `answers` | Object keyed by the supplied question IDs. |
 | `usage.input_tokens` | Exact union of token prefixes across the compiled question branches. Shared prefixes count once. Includes classifier instructions, examples, template tokens and suffixes. |
 | `usage.output_tokens` | Always 0 for this backend: it scores logits without sampling output tokens. |
@@ -202,7 +206,7 @@ scoring; see the precision notes in the README.
 
 ### Choice
 
-One branch assigns single-token labels `A`–`Z`, then `a`–`x`, for up to 50
+For up to 50 options, one branch assigns the unchanged single-token labels `A`–`Z`, then `a`–`x`. For 51–255 options the entire question instead uses distinct, fixed-width two-letter uppercase labels selected deterministically for the tokenizer (e.g. `AA`, `AB`). Single-letter labels are not mixed with two-letter labels, so no label is a prefix or substring of another. Both forms use one branch for the
 candidates. A softmax over candidate logits produces:
 
 | Field | Meaning |
@@ -265,12 +269,15 @@ values), `probabilities` (nine values), `expected_score`, `variance`, and `entro
 | `metadata.backend` | `llama-cpp` |
 | `metadata.model_revision` | Startup `--revision`, or null. |
 | `metadata.gguf_path` | Resolved local GGUF file path. |
+| `metadata.chat_template_source` | `gguf` for the embedded template, otherwise the `--chat-template-file` path. |
+| `metadata.prompt_policy` | Resolved startup prompt format. |
+| `metadata.prompt_policy_selection` | `mode` (`explicit`, `architecture-size`, or `unknown-baseline`) plus the matched `profile` and GGUF-derived `signature` when auto-selected. |
 | `metadata.n_gpu_layers` | Resolved layer offload count (`-1` = all layers). |
 | `metadata.kv_cache_dtype` | KV cache element type selected by `--dtype`. |
 | `metadata.stateful_architecture` | True when the model reports recurrent or hybrid state (`llama_model_is_recurrent` / `llama_model_is_hybrid`). Such models carry rolling state rather than per-position KV cells. |
 | `metadata.prefix_sharing` | True when branches share prefix KV cells, false when each branch prefills its own complete prompt. Resolved from `--prefix-sharing` and `metadata.stateful_architecture`. |
 | `metadata.rope_factor` | Startup `--rope-factor`. |
-| `metadata.template_version` | The resolved shared template version: `v1`. |
+| `metadata.template_version` | The resolved template version: `v1` for baseline, `hf-<policy>-v1` for a named format. |
 | `metadata.calibration` | `not_calibrated` |
 | `metadata.usage_accounting` | `unique_token_prefixes_and_engine_leaf_outputs` (legacy identifier). |
 
@@ -301,7 +308,24 @@ capacity (17 admitted requests), additional requests receive 429.
 
 The default request limit is 100 branches, configurable with
 `--max-request-branches`. Every question consumes exactly one branch. The schema
-caps questions at 256; choice/score criteria are limited to 50 entries.
+caps questions at 256. Choice supports 2–255 options, limited by `--max-choice-options` (default 255). Score remains limited to 50 levels.
+
+Set all three independently at startup, for example:
+
+```bash
+simple-jev --model Qwen/Qwen3.8-27B \
+  --max-request-branches 256 --max-model-len 32768 --max-choice-options 255
+```
+
+This permits up to 256 questions per request, each with up to 255 Choice options,
+provided each rendered branch fits 32768 tokens. Three 255-option questions use
+three branches, not 765. Setting a branch limit above 256 does not bypass the
+schema cap. These limits are not per-request fields; `max_tokens` does not set
+input length. Options, template overhead, and policy repetition count toward the
+branch's input tokens. All maxima need not fit simultaneously. Input violations
+return 422 rather than silently dropping questions, candidates, or context.
+
+For limits above 50, the GGUF loader checks, from a vocabulary-only load before any weights are loaded, that the GGUF vocabulary has enough distinct, non-control, single-token two-letter labels after the rendered `{"answer": "` boundary. If not, startup fails with guidance to reduce the limit. Actual rendered answer boundaries are checked again per request; incompatible boundaries return 422. No candidates are truncated and multi-token scoring is not substituted. More options lengthen the prompt, so context/token limits still apply.
 
 Each complete compiled branch, including shared context and appended question
 instructions, must fit `--max-model-len`. There is no automatic truncation.
@@ -340,7 +364,7 @@ and keeps its model lock until safe to release.
 
 | Status | Meaning |
 | --- | --- |
-| 422 | Invalid JSON/schema, unknown model, invalid context combination, unsupported chat/media/tool input, branch/token limits, or another compiler/backend `ValueError`. |
+| 422 | Invalid JSON/schema, a model ID other than the served name under `--enforce-model-id`, invalid context combination, unsupported chat/media/tool input, branch/token limits, or another compiler/backend `ValueError`. |
 | 429 | Request queue full; header `Retry-After: 1`, body `{"detail":"Scoring queue is full"}`. |
 | 499 | Client disconnected, if a response can still be delivered: `{"detail":"Client disconnected"}`. |
 | 500 | Unhandled runtime failure, such as a model execution error. No stable structured error body is guaranteed. |
@@ -350,7 +374,7 @@ Example semantic validation error:
 ```json
 {
   "error": {
-    "message": "Loaded model is 'Qwen/Qwen3.5-2B'",
+    "message": "Served model is 'qwen-gguf'",
     "type": "invalid_request_error",
     "code": 422,
     "param": null,
@@ -373,6 +397,46 @@ custom client fields. For example, `stream: true` still returns ordinary JSON,
 and `max_tokens` does not change the number of questions scored. Declared fields
 remain validated; misspelled fields inside questions/options are rejected.
 
+## Startup prompt policies
+
+If the flag is omitted, known architecture/size profiles auto-select the
+recommended policy; unknown profiles use baseline with a prominent tuning warning.
+The profile is read from the GGUF header (see
+[prompt format selection](README.md#prompt-format-selection)); no file or
+model-name matching is used. Set `--classifier-prompt-policy baseline` to
+preserve the former default or use plain-text `messages`. Advanced metadata
+includes `prompt_policy` and `prompt_policy_selection` (mode/profile/signature).
+
+An explicit `--classifier-prompt-policy` selects `baseline`, `examples_binary`,
+`repeat_state`, or `strict_mix_repeat2`. It is a startup setting, not a request
+field or header. Invalid names fail argument parsing; non-baseline policies
+with `--backend laya` fail before loading weights. Before loading GGUF weights,
+the server compiles a sample request with the resolved policy; a chat template or
+vocabulary that cannot serve it stops startup with guidance to pass
+`--chat-template-file` or choose another policy.
+
+| Policy | Formatting | Noul |
+|---|---|---|
+| `baseline` | Explicit legacy format, including plain-text chat support | Nine bins mapped to [0.01,0.99] |
+| `examples_binary` | Strict rules + worked examples; state once | Restricted probability of yes over no/yes, in [0,1] |
+| `repeat_state` | Same as examples_binary; state repeated twice | Same binary probability |
+| `strict_mix_repeat2` | Strict rules; full user-input block repeated twice | Original evaluated nine-bin wording and [0.01,0.99] mapping |
+
+Named policies require `state`; `messages` return 422. Existing text-only
+restrictions still apply. Choice branches use a fixed three-line native
+`[thinking]` prefill, not generated reasoning. Score/Noul do not use this prefill.
+The chat template must accept text-block content and render assistant
+`reasoning_content`, and the tokenizer must preserve the prefill and every
+allowed single-token answer boundary. The prefill is rendered with Transformers'
+`continue_final_message` rule, reproduced for llama.cpp's Jinja renderer. All policy content counts toward the complete branch token limit.
+
+Binary Noul responses contain only `type` and `noul`, including with advanced
+metrics; nine-bin rating diagnostics do not apply. Choice/Score response math
+and usage accounting are unchanged. Advanced metadata reports a distinct
+`hf-<policy>-v1` template version. Common v1 itself is not modified. These formats
+do not change the model precision, inference backend, cache, batching, workers
+or scheduler. See [model recommendations](README.md#prompt-format-selection).
+
 ## Server startup arguments — exhaustive list
 
 These are process settings, not HTTP request fields. Both `simple-jev` and
@@ -380,19 +444,24 @@ These are process settings, not HTTP request fields. Both `simple-jev` and
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `--model` | Required | GGUF file path, directory containing exactly one `.gguf`, or a Hugging Face GGUF repository id. Also the accepted request `model` string. |
+| `--model` | Required | GGUF file path, directory containing exactly one `.gguf`, or a Hugging Face GGUF repository id. Default public model ID. |
 | `--revision` | Unset | Hugging Face revision used when downloading the GGUF. |
 | `--gguf-file` | Unset | One `.gguf` filename to download from a Hugging Face repository with multiple variants. |
+| `--served-model-name` | value of `--model` | Public model ID in responses, health and discovery; does not change which GGUF is loaded. |
+| `--enforce-model-id` | off | Reject request IDs other than the served name. |
+| `--max-choice-options` | `255` | Choice cap from 2 to 255; Score/Noul unchanged. Above 50, the GGUF vocabulary must provide enough single-token two-letter labels, checked before weights load. |
+| `--classifier-prompt-policy` | Omitted: architecture/size selection | Known GGUF header profiles auto-select a recommended format; unknown profiles warn and use baseline. Explicit values always override, including baseline. |
+| `--chat-template-file` | Unset | Jinja chat template replacing the GGUF's embedded `tokenizer.chat_template`, for every format. |
 | `--backend` | `llama-cpp` | `llama-cpp` or `laya`. |
 | `--subfolder` | Unset | Laya checkpoint subfolder, e.g. `multilingual`. |
-| `--device` | `auto` | Weight placement: `cpu` keeps everything on the host; `auto`/`gpu`/`vulkan` offload all layers to any available llama.cpp backend with CPU fallback. |
-| `--n-gpu-layers` | Derived from `--device` | Explicit llama.cpp layer offload count; `-1` for all layers, overrides `--device`. |
-| `--dtype` | `bfloat16` | One of `float32`, `float16`, `bfloat16`: the KV cache element type. GGUF weights keep their own quantization. |
 | `--rope-factor` | `1` | Experimental linear RoPE interpolation factor applied to the context. |
-| `--max-model-len` | `16384` | Maximum token length of each compiled branch; also sizes the unified KV pool and is clamped to the model's trained context. |
+| `--device` | `auto` | Weight placement: `cpu` keeps everything on the host; `auto`/`gpu`/`vulkan` offload all layers to any available llama.cpp backend with CPU fallback. |
+| `--dtype` | `bfloat16` | One of `float32`, `float16`, `bfloat16`: the KV cache element type. GGUF weights keep their own quantization. |
+| `--n-gpu-layers` | Derived from `--device` | Explicit llama.cpp layer offload count; `-1` for all layers, overrides `--device`. |
+| `--max-model-len` | `16384` | Maximum input tokens per complete rendered question branch, including context, instructions, options, template overhead, and repetition. Not generated output length or native context extension. Also sizes the unified KV pool and is clamped to the model's trained context. |
 | `--max-batch-size` | `32` | Maximum suffix rows per decode; the context allows one prefix sequence plus this many row sequences. |
 | `--max-batch-tokens` | `32768` | Maximum packed suffix tokens per decode; must be positive. Does not chunk or limit the prefix decode. Bounds complete branch lengths, not suffixes, when prefix sharing is disabled. |
-| `--max-request-branches` | `100` | Positive branch cap per classifier request, subject to schema hard limits. |
+| `--max-request-branches` | `100` | Maximum questions per request: each question uses one branch regardless of option count. Set 256 for the schema maximum; larger settings cannot bypass it. |
 | `--prefix-sharing` | `auto` | `auto`, `on` or `off`. Whether branches share prefix KV cells via `llama_memory_seq_cp`. `auto` shares them for ordinary attention models and disables sharing for recurrent/hybrid architectures, which then prefill each branch separately. `on` forces sharing for every architecture; `off` forces per-branch prefill. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | HTTP port. |
